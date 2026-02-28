@@ -43,6 +43,8 @@ Release expectations for crates.io phase:
 ## Documentation
 
 - `docs/block-data-structure.md`: canonical binary layout, invariants, and construction rules.
+- `docs/release-process.md`: versioning, changelog, tagging, and release checklist.
+- `CHANGELOG.md`: user-visible release history.
 
 ## Version Invariant
 
