@@ -2,6 +2,32 @@
 
 Canonical MoonBlokz `no_std` chain data structures and hash contract.
 
+## Integration and Distribution
+
+Current recommended integration model is Git dependency. Future crates.io
+release model is documented below for later phase adoption.
+
+### Current: Git Dependency
+
+```toml
+[dependencies]
+moonblokz-chain-types = { git = "https://github.com/petersallai/moonblokz-chain-types" }
+```
+
+### Future: crates.io Dependency
+
+After crates.io publication, dependency wiring should switch to versioned crates:
+
+```toml
+[dependencies]
+moonblokz-chain-types = "0.1"
+```
+
+Release expectations for crates.io phase:
+- Keep `no_std` compatibility unchanged.
+- Preserve canonical block binary layout unless a documented breaking release is made.
+- Publish semver-compatible updates with changelog notes for API/contract changes.
+
 ## API Overview
 
 - `Block`: immutable block wrapper over fixed-size internal storage.

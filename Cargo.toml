@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "MoonBlokz no_std canonical blockchain data types and hash contract."
 license = "MIT"
+readme = "README.md"
 repository = "https://github.com/petersallai/moonblokz-chain-types"
 keywords = ["embedded", "no-std", "blockchain", "types", "sha256"]
 categories = ["embedded", "no-std"]
