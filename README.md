@@ -14,6 +14,10 @@ Canonical MoonBlokz `no_std` chain data structures and hash contract.
   - `MAX_PAYLOAD_SIZE`
   - `HASH_SIZE`
 
+## Documentation
+
+- `docs/block-data-structure.md`: canonical binary layout, invariants, and construction rules.
+
 ## Version Invariant
 
 - `version == 0` is reserved for storage empty-slot markers.
