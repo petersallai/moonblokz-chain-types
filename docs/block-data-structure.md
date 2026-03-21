@@ -6,7 +6,7 @@ This document defines the canonical MoonBlokz block layout used by
 ## Overview
 
 - A `Block` stores serialized bytes in a fixed `[u8; MAX_BLOCK_SIZE]` buffer.
-- The logical block length is tracked internally and exposed via `as_bytes()`.
+- The logical block length is tracked internally and exposed via `serialized_bytes()`.
 - Blocks are immutable after creation.
 - `version == 0` is invalid for real blocks and reserved for storage empty-slot markers.
 
@@ -44,7 +44,7 @@ This document defines the canonical MoonBlokz block layout used by
 ## Serialization
 
 - `Block` is already stored in serialized form internally.
-- `serialized_bytes()` returns the same canonical byte slice as `as_bytes()`.
+- `serialized_bytes()` returns the canonical byte slice.
 
 ## Hashing
 

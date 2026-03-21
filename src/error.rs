@@ -1,6 +1,16 @@
-/*! Error types for MoonBlokz canonical chain types. */
+/*! Error types for MoonBlokz canonical chain types.
+
+# Design note — embedded target
+
+This is an embedded (`no_std`) library optimised for minimal binary size.
+`Debug`, `Display`, and similar trait implementations are intentionally
+omitted to avoid pulling formatting machinery into the final binary.
+*/
 
 /// Errors returned by block parsing and block construction.
+///
+/// Trait implementations such as `Debug` and `Display` are intentionally
+/// omitted to minimise binary size on embedded targets.
 pub enum BlockError {
     /// Input buffer is shorter than the required minimum block size.
     InputTooSmall { min: usize, actual: usize },
