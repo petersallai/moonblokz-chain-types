@@ -11,6 +11,7 @@ omitted to avoid pulling formatting machinery into the final binary.
 ///
 /// Trait implementations such as `Debug` and `Display` are intentionally
 /// omitted to minimise binary size on embedded targets.
+#[cfg_attr(test, derive(Debug))]
 pub enum BlockError {
     /// Input buffer is shorter than the required minimum block size.
     InputTooSmall { min: usize, actual: usize },

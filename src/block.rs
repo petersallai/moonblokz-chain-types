@@ -16,7 +16,9 @@ machinery and extra code into the final binary. Derive them downstream
 via newtype wrappers if needed for diagnostics or testing.
 */
 
+use crate::balance::{BALANCE_HEADER_SIZE, BalanceBlockPayloadView, NodeInfo};
 use crate::error::BlockError;
+use crate::transaction::{ComplexTransaction, NodeTransfer, Registration, TransactionBlockPayloadView};
 
 /// Maximum encoded block size in bytes.
 pub const MAX_BLOCK_SIZE: usize = 2016;
@@ -38,6 +40,15 @@ const PAYLOAD_OFFSET: usize = HEADER_SIZE;
 
 /// Maximum payload bytes that can fit in a block.
 pub const MAX_PAYLOAD_SIZE: usize = MAX_BLOCK_SIZE - HEADER_SIZE;
+
+/// Payload type: transaction block.
+pub const PAYLOAD_TYPE_TRANSACTION: u8 = 1;
+/// Payload type: balance block.
+pub const PAYLOAD_TYPE_BALANCE: u8 = 2;
+/// Payload type: chain configuration block.
+pub const PAYLOAD_TYPE_CHAIN_CONFIG: u8 = 3;
+/// Payload type: approval (evidence) block.
+pub const PAYLOAD_TYPE_APPROVAL: u8 = 4;
 
 /// Parsed view of the fixed block header.
 ///
@@ -184,55 +195,54 @@ impl Block {
         self.len
     }
 
-    /// Parses and returns the fixed-size header.
-    ///
-    /// Parameters:
-    /// - none.
-    ///
-    /// Example:
-    /// ```
-    /// use moonblokz_chain_types::{BlockBuilder, BlockHeader};
-    ///
-    /// let header = BlockHeader {
-    ///     version: 1,
-    ///     sequence: 42,
-    ///     creator: 0,
-    ///     mined_amount: 0,
-    ///     payload_type: 0,
-    ///     consumed_votes: 0,
-    ///     first_voted_node: 0,
-    ///     consumed_votes_from_first_voted_node: 0,
-    ///     previous_hash: [0; 32],
-    ///     signature: [0; 64],
-    /// };
-    ///
-    /// let block_result = BlockBuilder::new().header(header).build();
-    /// assert!(block_result.is_ok());
-    /// let block = match block_result {
-    ///     Ok(value) => value,
-    ///     Err(_) => return,
-    /// };
-    /// assert_eq!(block.header().sequence, 42);
-    /// ```
-    pub fn header(&self) -> BlockHeader {
-        let mut previous_hash = [0u8; 32];
-        previous_hash.copy_from_slice(&self.data[PREVIOUS_HASH_OFFSET..PREVIOUS_HASH_OFFSET + 32]);
+    /// Block version. `0` is reserved for storage empty-slot markers.
+    pub fn version(&self) -> u8 {
+        self.data[VERSION_OFFSET]
+    }
 
-        let mut signature = [0u8; 64];
-        signature.copy_from_slice(&self.data[SIGNATURE_OFFSET..SIGNATURE_OFFSET + 64]);
+    /// Block sequence number.
+    pub fn sequence(&self) -> u32 {
+        read_u32_le(&self.data, SEQUENCE_OFFSET)
+    }
 
-        BlockHeader {
-            version: self.data[VERSION_OFFSET],
-            sequence: read_u32_le(&self.data, SEQUENCE_OFFSET),
-            creator: read_u32_le(&self.data, CREATOR_OFFSET),
-            mined_amount: read_u32_le(&self.data, MINED_AMOUNT_OFFSET),
-            payload_type: self.data[PAYLOAD_TYPE_OFFSET],
-            consumed_votes: read_u32_le(&self.data, CONSUMED_VOTES_OFFSET),
-            first_voted_node: read_u32_le(&self.data, FIRST_VOTED_NODE_OFFSET),
-            consumed_votes_from_first_voted_node: read_u32_le(&self.data, CONSUMED_VOTES_FROM_FIRST_OFFSET),
-            previous_hash,
-            signature,
-        }
+    /// Creator node id.
+    pub fn creator(&self) -> u32 {
+        read_u32_le(&self.data, CREATOR_OFFSET)
+    }
+
+    /// Mined amount (excluding transaction fees).
+    pub fn mined_amount(&self) -> u32 {
+        read_u32_le(&self.data, MINED_AMOUNT_OFFSET)
+    }
+
+    /// Payload type discriminator.
+    pub fn payload_type(&self) -> u8 {
+        self.data[PAYLOAD_TYPE_OFFSET]
+    }
+
+    /// Consumed votes.
+    pub fn consumed_votes(&self) -> u32 {
+        read_u32_le(&self.data, CONSUMED_VOTES_OFFSET)
+    }
+
+    /// First voted node id.
+    pub fn first_voted_node(&self) -> u32 {
+        read_u32_le(&self.data, FIRST_VOTED_NODE_OFFSET)
+    }
+
+    /// Consumed votes from first voted node.
+    pub fn consumed_votes_from_first_voted_node(&self) -> u32 {
+        read_u32_le(&self.data, CONSUMED_VOTES_FROM_FIRST_OFFSET)
+    }
+
+    /// Previous block hash (32 bytes, borrowed).
+    pub fn previous_hash(&self) -> &[u8] {
+        &self.data[PREVIOUS_HASH_OFFSET..PREVIOUS_HASH_OFFSET + 32]
+    }
+
+    /// Block signature (64 bytes, borrowed).
+    pub fn signature(&self) -> &[u8] {
+        &self.data[SIGNATURE_OFFSET..SIGNATURE_OFFSET + 64]
     }
 
     /// Returns the payload slice.
@@ -242,37 +252,37 @@ impl Block {
     ///
     /// Example:
     /// ```
-    /// use moonblokz_chain_types::{BlockBuilder, BlockHeader};
+    /// use moonblokz_chain_types::{Block, HEADER_SIZE};
     ///
-    /// let header = BlockHeader {
-    ///     version: 1,
-    ///     sequence: 0,
-    ///     creator: 0,
-    ///     mined_amount: 0,
-    ///     payload_type: 0,
-    ///     consumed_votes: 0,
-    ///     first_voted_node: 0,
-    ///     consumed_votes_from_first_voted_node: 0,
-    ///     previous_hash: [0; 32],
-    ///     signature: [0; 64],
-    /// };
-    ///
-    /// let builder_result = BlockBuilder::new().header(header).payload(&[1, 2, 3]);
-    /// assert!(builder_result.is_ok());
-    /// let builder = match builder_result {
-    ///     Ok(value) => value,
-    ///     Err(_) => return,
-    /// };
-    /// let block_result = builder.build();
-    /// assert!(block_result.is_ok());
-    /// let block = match block_result {
-    ///     Ok(value) => value,
+    /// let mut bytes = [0u8; HEADER_SIZE + 3];
+    /// bytes[0] = 1;
+    /// bytes[HEADER_SIZE] = 1;
+    /// bytes[HEADER_SIZE + 1] = 2;
+    /// bytes[HEADER_SIZE + 2] = 3;
+    /// let block = match Block::from_bytes(&bytes) {
+    ///     Ok(b) => b,
     ///     Err(_) => return,
     /// };
     /// assert_eq!(block.payload(), &[1, 2, 3]);
     /// ```
     pub fn payload(&self) -> &[u8] {
         &self.data[PAYLOAD_OFFSET..self.len]
+    }
+
+    /// Returns a transaction block payload view if `payload_type() == 1`.
+    pub fn transactions(&self) -> Option<TransactionBlockPayloadView<'_>> {
+        if self.data[PAYLOAD_TYPE_OFFSET] != PAYLOAD_TYPE_TRANSACTION {
+            return None;
+        }
+        TransactionBlockPayloadView::new(self.payload())
+    }
+
+    /// Returns a balance block payload view if `payload_type() == 2`.
+    pub fn balances(&self) -> Option<BalanceBlockPayloadView<'_>> {
+        if self.data[PAYLOAD_TYPE_OFFSET] != PAYLOAD_TYPE_BALANCE {
+            return None;
+        }
+        BalanceBlockPayloadView::new(self.payload())
     }
 
     fn validate_structure(&self) -> Result<(), BlockError> {
@@ -291,6 +301,8 @@ pub struct BlockBuilder {
     header: BlockHeader,
     payload: [u8; MAX_PAYLOAD_SIZE],
     payload_len: usize,
+    item_count: u16,
+    max_node_id: u32,
 }
 
 impl BlockBuilder {
@@ -331,6 +343,8 @@ impl BlockBuilder {
             },
             payload: [0u8; MAX_PAYLOAD_SIZE],
             payload_len: 0,
+            item_count: 0,
+            max_node_id: 0,
         }
     }
 
@@ -362,33 +376,109 @@ impl BlockBuilder {
         self
     }
 
-    /// Sets payload bytes for the block under construction.
+    // -- Type-safe add methods --
+
+    /// Adds a node-transfer transaction to the block payload.
     ///
-    /// Parameters:
-    /// - `payload`: payload bytes to store after the fixed header.
+    /// The payload type is automatically set to `PAYLOAD_TYPE_TRANSACTION` on the
+    /// first call. Subsequent calls must be consistent (only transaction types).
+    pub fn add_node_transfer(&mut self, tx: &NodeTransfer) -> Result<&mut Self, BlockError> {
+        self.ensure_managed_payload(PAYLOAD_TYPE_TRANSACTION)?;
+        self.append_item(tx.as_bytes())
+    }
+
+    /// Adds a registration transaction to the block payload.
+    pub fn add_registration(&mut self, tx: &Registration) -> Result<&mut Self, BlockError> {
+        self.ensure_managed_payload(PAYLOAD_TYPE_TRANSACTION)?;
+        self.append_item(tx.as_bytes())
+    }
+
+    /// Adds a complex transaction to the block payload.
+    pub fn add_complex_transaction(&mut self, tx: &ComplexTransaction) -> Result<&mut Self, BlockError> {
+        self.ensure_managed_payload(PAYLOAD_TYPE_TRANSACTION)?;
+        self.append_item(tx.as_bytes())
+    }
+
+    /// Adds a transaction from its raw binary form to the block payload.
+    pub fn add_transaction_bytes(&mut self, bytes: &[u8]) -> Result<&mut Self, BlockError> {
+        self.ensure_managed_payload(PAYLOAD_TYPE_TRANSACTION)?;
+        self.append_item(bytes)
+    }
+
+    /// Adds a node-info balance entry to the block payload.
     ///
-    /// Example:
-    /// ```
-    /// use moonblokz_chain_types::BlockBuilder;
-    ///
-    /// let builder_result = BlockBuilder::new().payload(&[1, 2, 3]);
-    /// assert!(builder_result.is_ok());
-    /// let builder = match builder_result {
-    ///     Ok(value) => value,
-    ///     Err(_) => return,
-    /// };
-    /// let _use_builder = builder;
-    /// ```
-    pub fn payload(mut self, payload: &[u8]) -> Result<Self, BlockError> {
-        if payload.len() > MAX_PAYLOAD_SIZE {
+    /// The payload type is automatically set to `PAYLOAD_TYPE_BALANCE` on the
+    /// first call. Subsequent calls must be consistent (only balance entries).
+    /// The `max_node_id` is tracked automatically from the added entries;
+    /// use `set_max_node_id` to override.
+    pub fn add_node_info(&mut self, ni: &NodeInfo) -> Result<&mut Self, BlockError> {
+        self.ensure_managed_payload(PAYLOAD_TYPE_BALANCE)?;
+        let bytes = ni.as_bytes();
+        let new_len = self.payload_len + bytes.len();
+        if new_len > MAX_PAYLOAD_SIZE {
             return Err(BlockError::PayloadTooLarge {
                 max: MAX_PAYLOAD_SIZE,
-                actual: payload.len(),
+                actual: new_len,
             });
         }
+        self.payload[self.payload_len..new_len].copy_from_slice(bytes);
+        self.payload_len = new_len;
+        self.item_count += 1;
+        self.payload[0..2].copy_from_slice(&self.item_count.to_le_bytes());
+        let owner = ni.owner();
+        if owner > self.max_node_id {
+            self.max_node_id = owner;
+            self.payload[2..6].copy_from_slice(&self.max_node_id.to_le_bytes());
+        }
+        Ok(self)
+    }
 
-        self.payload[..payload.len()].copy_from_slice(payload);
-        self.payload_len = payload.len();
+    /// Sets the `max_node_id` for a balance block.
+    ///
+    /// This overrides the auto-tracked value. Only valid for balance payloads.
+    pub fn set_max_node_id(&mut self, max_node_id: u32) -> Result<&mut Self, BlockError> {
+        self.ensure_managed_payload(PAYLOAD_TYPE_BALANCE)?;
+        self.max_node_id = max_node_id;
+        self.payload[2..6].copy_from_slice(&self.max_node_id.to_le_bytes());
+        Ok(self)
+    }
+
+    fn ensure_managed_payload(&mut self, expected_type: u8) -> Result<(), BlockError> {
+        if self.payload_len == 0 {
+            if self.header.payload_type != 0 && self.header.payload_type != expected_type {
+                return Err(BlockError::MalformedBlock("payload type mismatch"));
+            }
+            self.header.payload_type = expected_type;
+            match expected_type {
+                PAYLOAD_TYPE_TRANSACTION => {
+                    self.payload[0..2].copy_from_slice(&0u16.to_le_bytes());
+                    self.payload_len = 2;
+                }
+                PAYLOAD_TYPE_BALANCE => {
+                    self.payload[0..2].copy_from_slice(&0u16.to_le_bytes());
+                    self.payload[2..6].copy_from_slice(&0u32.to_le_bytes());
+                    self.payload_len = BALANCE_HEADER_SIZE;
+                }
+                _ => {}
+            }
+        } else if self.header.payload_type != expected_type {
+            return Err(BlockError::MalformedBlock("payload type mismatch"));
+        }
+        Ok(())
+    }
+
+    fn append_item(&mut self, bytes: &[u8]) -> Result<&mut Self, BlockError> {
+        let new_len = self.payload_len + bytes.len();
+        if new_len > MAX_PAYLOAD_SIZE {
+            return Err(BlockError::PayloadTooLarge {
+                max: MAX_PAYLOAD_SIZE,
+                actual: new_len,
+            });
+        }
+        self.payload[self.payload_len..new_len].copy_from_slice(bytes);
+        self.payload_len = new_len;
+        self.item_count += 1;
+        self.payload[0..2].copy_from_slice(&self.item_count.to_le_bytes());
         Ok(self)
     }
 
@@ -463,8 +553,21 @@ impl AsRef<[u8]> for Block {
     }
 }
 
-fn read_u32_le(bytes: &[u8; MAX_BLOCK_SIZE], offset: usize) -> u32 {
-    u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]])
+pub(crate) fn read_u32_le(data: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]])
+}
+
+pub(crate) fn read_u64_le(data: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes([
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+        data[offset + 4],
+        data[offset + 5],
+        data[offset + 6],
+        data[offset + 7],
+    ])
 }
 
 #[cfg(test)]
@@ -488,32 +591,29 @@ mod tests {
 
     #[test]
     fn builder_round_trip_from_bytes() {
-        let builder_result = BlockBuilder::new().header(sample_header()).payload(&[1, 2, 3, 4]);
-        assert!(builder_result.is_ok());
-        let build_result = builder_result.unwrap_or_else(|_| unreachable!()).build();
-        assert!(build_result.is_ok());
-        let block = build_result.unwrap_or_else(|_| unreachable!());
+        let sig = [0xAA; 64];
+        let nt = NodeTransfer::new(99, 10, 1, 2, 1000, 5, 42, &sig);
+        let mut builder = BlockBuilder::new().header(BlockHeader {
+            payload_type: 0,
+            ..sample_header()
+        });
+        builder.add_node_transfer(&nt).unwrap();
+        let block = builder.build().unwrap();
 
-        let parsed_result = Block::from_bytes(block.serialized_bytes());
-        assert!(parsed_result.is_ok());
-        let parsed = parsed_result.unwrap_or_else(|_| unreachable!());
+        let parsed = Block::from_bytes(block.serialized_bytes()).unwrap();
 
-        let parsed_header = parsed.header();
-        let expected = sample_header();
-        assert_eq!(parsed_header.version, expected.version);
-        assert_eq!(parsed_header.sequence, expected.sequence);
-        assert_eq!(parsed_header.creator, expected.creator);
-        assert_eq!(parsed_header.mined_amount, expected.mined_amount);
-        assert_eq!(parsed_header.payload_type, expected.payload_type);
-        assert_eq!(parsed_header.consumed_votes, expected.consumed_votes);
-        assert_eq!(parsed_header.first_voted_node, expected.first_voted_node);
-        assert_eq!(
-            parsed_header.consumed_votes_from_first_voted_node,
-            expected.consumed_votes_from_first_voted_node
-        );
-        assert_eq!(parsed_header.previous_hash, expected.previous_hash);
-        assert_eq!(parsed_header.signature, expected.signature);
-        assert_eq!(parsed.payload(), &[1, 2, 3, 4]);
+        assert_eq!(parsed.version(), 2);
+        assert_eq!(parsed.sequence(), 42);
+        assert_eq!(parsed.creator(), 7);
+        assert_eq!(parsed.mined_amount(), 11);
+        assert_eq!(parsed.payload_type(), PAYLOAD_TYPE_TRANSACTION);
+        assert_eq!(parsed.consumed_votes(), 101);
+        assert_eq!(parsed.first_voted_node(), 19);
+        assert_eq!(parsed.consumed_votes_from_first_voted_node(), 17);
+        assert_eq!(parsed.previous_hash(), &[9u8; 32][..]);
+        assert_eq!(parsed.signature(), &[5u8; 64][..]);
+        let tx = parsed.transactions().unwrap().iter().next().unwrap();
+        assert_eq!(tx.as_node_transfer().unwrap().amount(), 1000);
     }
 
     #[test]
@@ -556,43 +656,33 @@ mod tests {
             ..sample_header()
         };
 
-        let builder_result = BlockBuilder::new().header(header).payload(&[42]);
-        assert!(builder_result.is_ok());
-        let build_result = builder_result.unwrap_or_else(|_| unreachable!()).build();
-        assert!(build_result.is_ok());
-        let block = build_result.unwrap_or_else(|_| unreachable!());
+        let block = BlockBuilder::new().header(header).build().unwrap();
 
-        let h = block.header();
-        assert_eq!(h.version, 2);
-        assert_eq!(h.sequence, 42);
-        assert_eq!(h.creator, 7);
-        assert_eq!(h.mined_amount, 11);
-        assert_eq!(h.payload_type, 3);
-        assert_eq!(h.consumed_votes, 101);
-        assert_eq!(h.first_voted_node, 19);
-        assert_eq!(h.consumed_votes_from_first_voted_node, 17);
-        assert_eq!(h.previous_hash[0], 99);
-        assert_eq!(h.signature[63], 88);
-        assert_eq!(block.payload(), &[42]);
+        assert_eq!(block.version(), 2);
+        assert_eq!(block.sequence(), 42);
+        assert_eq!(block.creator(), 7);
+        assert_eq!(block.mined_amount(), 11);
+        assert_eq!(block.payload_type(), 3);
+        assert_eq!(block.consumed_votes(), 101);
+        assert_eq!(block.first_voted_node(), 19);
+        assert_eq!(block.consumed_votes_from_first_voted_node(), 17);
+        assert_eq!(block.previous_hash()[0], 99);
+        assert_eq!(block.signature()[63], 88);
+        assert!(block.payload().is_empty());
     }
 
     #[test]
-    fn max_payload_size_accepted() {
-        let payload = [0xABu8; MAX_PAYLOAD_SIZE];
-        let builder_result = BlockBuilder::new().header(sample_header()).payload(&payload);
-        assert!(builder_result.is_ok());
-        let build_result = builder_result.unwrap_or_else(|_| unreachable!()).build();
-        assert!(build_result.is_ok());
-        let block = build_result.unwrap_or_else(|_| unreachable!());
+    fn max_block_size_accepted() {
+        let mut bytes = [0u8; MAX_BLOCK_SIZE];
+        bytes[0] = 1;
+        let block = Block::from_bytes(&bytes).unwrap();
         assert_eq!(block.len(), MAX_BLOCK_SIZE);
         assert_eq!(block.payload().len(), MAX_PAYLOAD_SIZE);
     }
 
     #[test]
     fn header_only_block_has_empty_payload() {
-        let build_result = BlockBuilder::new().header(sample_header()).build();
-        assert!(build_result.is_ok());
-        let block = build_result.unwrap_or_else(|_| unreachable!());
+        let block = BlockBuilder::new().header(sample_header()).build().unwrap();
         assert!(block.payload().is_empty());
         assert_eq!(block.len(), HEADER_SIZE);
     }
@@ -612,9 +702,7 @@ mod tests {
             signature: [0xBB; 64],
         };
 
-        let build_result = BlockBuilder::new().header(header).build();
-        assert!(build_result.is_ok());
-        let block = build_result.unwrap_or_else(|_| unreachable!());
+        let block = BlockBuilder::new().header(header).build().unwrap();
         let bytes = block.serialized_bytes();
 
         assert_eq!(bytes[0], 1); // version
@@ -628,5 +716,154 @@ mod tests {
         assert_eq!(&bytes[26..58], &[0xAA; 32]); // previous_hash
         assert_eq!(&bytes[58..122], &[0xBB; 64]); // signature
         assert_eq!(bytes.len(), HEADER_SIZE);
+    }
+
+    // -- Add method tests --
+
+    #[test]
+    fn block_builder_add_node_transfer() {
+        let sig = [0xAA; 64];
+        let nt = NodeTransfer::new(99, 10, 1, 2, 1000, 5, 42, &sig);
+        let mut builder = BlockBuilder::new().header(BlockHeader {
+            payload_type: 0,
+            ..sample_header()
+        });
+        builder.add_node_transfer(&nt).unwrap();
+        let block = builder.build().unwrap();
+        assert_eq!(block.payload_type(), PAYLOAD_TYPE_TRANSACTION);
+        let txp = block.transactions().unwrap();
+        assert_eq!(txp.count(), 1);
+        let tx = txp.iter().next().unwrap();
+        assert_eq!(tx.vote(), 99);
+        let nv = tx.as_node_transfer().unwrap();
+        assert_eq!(nv.amount(), 1000);
+    }
+
+    #[test]
+    fn block_builder_add_two_node_transfers() {
+        let sig = [0xAA; 64];
+        let nt1 = NodeTransfer::new(1, 10, 1, 2, 100, 1, 0, &sig);
+        let nt2 = NodeTransfer::new(2, 20, 3, 4, 200, 2, 1, &sig);
+        let mut builder = BlockBuilder::new().header(BlockHeader {
+            payload_type: 0,
+            ..sample_header()
+        });
+        builder.add_node_transfer(&nt1).unwrap();
+        builder.add_node_transfer(&nt2).unwrap();
+        let block = builder.build().unwrap();
+        let txp = block.transactions().unwrap();
+        assert_eq!(txp.count(), 2);
+        let mut iter = txp.iter();
+        assert_eq!(iter.next().unwrap().as_node_transfer().unwrap().amount(), 100);
+        assert_eq!(iter.next().unwrap().as_node_transfer().unwrap().amount(), 200);
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn block_builder_add_transaction_bytes() {
+        let sig = [0xAA; 64];
+        let nt = NodeTransfer::new(99, 10, 1, 2, 1000, 5, 42, &sig);
+        let mut builder = BlockBuilder::new().header(BlockHeader {
+            payload_type: 0,
+            ..sample_header()
+        });
+        builder.add_transaction_bytes(nt.as_bytes()).unwrap();
+        let block = builder.build().unwrap();
+        assert_eq!(block.payload_type(), PAYLOAD_TYPE_TRANSACTION);
+        let txp = block.transactions().unwrap();
+        assert_eq!(txp.count(), 1);
+        let tx = txp.iter().next().unwrap();
+        assert_eq!(tx.as_node_transfer().unwrap().amount(), 1000);
+    }
+
+    #[test]
+    fn block_builder_add_node_info() {
+        let pub_key = [0xBB; 32];
+        let ni = NodeInfo::new(5, 2000, 3, &pub_key);
+        let mut builder = BlockBuilder::new().header(BlockHeader {
+            payload_type: 0,
+            ..sample_header()
+        });
+        builder.add_node_info(&ni).unwrap();
+        let block = builder.build().unwrap();
+        assert_eq!(block.payload_type(), PAYLOAD_TYPE_BALANCE);
+        let bp = block.balances().unwrap();
+        assert_eq!(bp.count(), 1);
+        assert_eq!(bp.max_node_id(), 5);
+        let entry = bp.iter().next().unwrap();
+        assert_eq!(entry.owner(), 5);
+        assert_eq!(entry.balance(), 2000);
+    }
+
+    #[test]
+    fn block_builder_set_max_node_id() {
+        let pub_key = [0; 32];
+        let ni = NodeInfo::new(3, 100, 0, &pub_key);
+        let mut builder = BlockBuilder::new().header(BlockHeader {
+            payload_type: 0,
+            ..sample_header()
+        });
+        builder.add_node_info(&ni).unwrap();
+        builder.set_max_node_id(999).unwrap();
+        let block = builder.build().unwrap();
+        let bp = block.balances().unwrap();
+        assert_eq!(bp.max_node_id(), 999);
+    }
+
+    #[test]
+    fn block_builder_rejects_type_mismatch() {
+        let sig = [0xAA; 64];
+        let nt = NodeTransfer::new(0, 0, 0, 0, 0, 0, 0, &sig);
+        let pub_key = [0; 32];
+        let ni = NodeInfo::new(0, 0, 0, &pub_key);
+        let mut builder = BlockBuilder::new().header(BlockHeader {
+            payload_type: 0,
+            ..sample_header()
+        });
+        builder.add_node_transfer(&nt).unwrap();
+        let result = builder.add_node_info(&ni);
+        assert!(matches!(result, Err(BlockError::MalformedBlock("payload type mismatch"))));
+    }
+
+    #[test]
+    fn from_bytes_with_truncated_payload() {
+        let mut bytes = [0u8; HEADER_SIZE];
+        bytes[0] = 1;
+        bytes[PAYLOAD_TYPE_OFFSET] = PAYLOAD_TYPE_BALANCE;
+        let block = Block::from_bytes(&bytes).unwrap();
+        assert!(block.payload().is_empty());
+        assert!(block.balances().is_none());
+    }
+
+    #[test]
+    fn set_max_node_id_lower_than_auto_tracked() {
+        let pub_key = [0; 32];
+        let ni = NodeInfo::new(100, 500, 0, &pub_key);
+        let mut builder = BlockBuilder::new().header(BlockHeader {
+            payload_type: 0,
+            ..sample_header()
+        });
+        builder.add_node_info(&ni).unwrap();
+        builder.set_max_node_id(50).unwrap();
+        let block = builder.build().unwrap();
+        let bp = block.balances().unwrap();
+        assert_eq!(bp.max_node_id(), 50);
+    }
+
+    #[test]
+    fn add_methods_reject_at_max_payload() {
+        let sig = [0xAA; 64];
+        let nt = NodeTransfer::new(0, 0, 0, 0, 0, 0, 0, &sig);
+        let mut builder = BlockBuilder::new().header(BlockHeader {
+            payload_type: 0,
+            ..sample_header()
+        });
+        // NODE_TRANSFER_SIZE = 101. Payload header = 2. Available = 1894 - 2 = 1892.
+        // 18 * 101 = 1818 <= 1892, 19 * 101 = 1919 > 1892.
+        for _ in 0..18 {
+            builder.add_node_transfer(&nt).unwrap();
+        }
+        let result = builder.add_node_transfer(&nt);
+        assert!(matches!(result, Err(BlockError::PayloadTooLarge { .. })));
     }
 }

@@ -71,8 +71,6 @@ let header = BlockHeader {
 
 let block = BlockBuilder::new()
     .header(header)
-    .payload(&[1, 2, 3])
-    .unwrap()
     .build()
     .unwrap();
 
