@@ -135,6 +135,13 @@ impl NodeInfo {
 mod tests {
     use super::*;
     use crate::block::{BlockBuilder, BlockHeader};
+    use moonblokz_crypto::{Crypto, CryptoTrait, PRIVATE_KEY_SIZE};
+
+    fn test_crypto() -> Crypto {
+        Crypto::new([1u8; PRIVATE_KEY_SIZE])
+            .ok()
+            .expect("test private key should be accepted")
+    }
 
     fn sample_balance_header() -> BlockHeader {
         BlockHeader {
@@ -160,7 +167,7 @@ mod tests {
         let mut builder = BlockBuilder::new().header(sample_balance_header());
         builder.add_node_info(&ni).unwrap();
         builder.set_max_node_id(100).unwrap();
-        let block = builder.build().unwrap();
+        let block = builder.build_signed(&test_crypto()).unwrap();
 
         let bp = block.balances().unwrap();
         assert_eq!(bp.count(), 1);
@@ -179,7 +186,10 @@ mod tests {
             payload_type: 1,
             ..sample_balance_header()
         };
-        let block = BlockBuilder::new().header(header).build().unwrap();
+        let block = BlockBuilder::new()
+            .header(header)
+            .build_signed(&test_crypto())
+            .unwrap();
         assert!(block.balances().is_none());
     }
 
@@ -192,7 +202,7 @@ mod tests {
         builder.add_node_info(&ni1).unwrap();
         builder.add_node_info(&ni2).unwrap();
         builder.set_max_node_id(50).unwrap();
-        let block = builder.build().unwrap();
+        let block = builder.build_signed(&test_crypto()).unwrap();
 
         let bp = block.balances().unwrap();
         assert_eq!(bp.count(), 2);
@@ -212,7 +222,9 @@ mod tests {
         assert_eq!(ni.as_bytes().len(), NODE_INFO_SIZE);
         assert_eq!(ni.owner(), 5);
 
-        let view = NodeInfoView { data: ni.as_bytes() };
+        let view = NodeInfoView {
+            data: ni.as_bytes(),
+        };
         assert_eq!(view.owner(), 5);
         assert_eq!(view.balance(), 2000);
         assert_eq!(view.vote_count(), 3);

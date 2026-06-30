@@ -5,8 +5,9 @@ Builder types (`NodeTransfer`, `Registration`, `ComplexTransaction`) contain
 owned byte arrays for constructing transactions before adding them to a block.
 */
 
-use crate::block::{read_u32_le, read_u64_le, MAX_PAYLOAD_SIZE};
+use crate::block::{MAX_PAYLOAD_SIZE, read_u32_le, read_u64_le};
 use crate::error::BlockError;
+use moonblokz_crypto::{CryptoTrait, SignatureTrait};
 
 // Transaction type discriminators.
 const TX_TYPE_NODE_TRANSFER: u8 = 1;
@@ -19,6 +20,10 @@ const TX_HEADER_SIZE: usize = 5;
 // Body sizes (after common header).
 const NODE_TRANSFER_BODY_SIZE: usize = 96;
 const REGISTRATION_BODY_SIZE: usize = 184;
+
+const NODE_TRANSFER_SIGNATURE_OFFSET: usize = 37;
+const REGISTRATION_NEW_KEY_SIGNATURE_OFFSET: usize = 61;
+const REGISTRATION_SIGNATURE_OFFSET: usize = 125;
 
 /// Total encoded size of a node-transfer transaction (header + body).
 pub const NODE_TRANSFER_SIZE: usize = TX_HEADER_SIZE + NODE_TRANSFER_BODY_SIZE;
@@ -483,8 +488,41 @@ impl NodeTransfer {
         data[17..25].copy_from_slice(&amount.to_le_bytes());
         data[25..29].copy_from_slice(&fee.to_le_bytes());
         data[29..37].copy_from_slice(&comment.to_le_bytes());
-        data[37..101].copy_from_slice(signature);
+        data[NODE_TRANSFER_SIGNATURE_OFFSET..NODE_TRANSFER_SIZE].copy_from_slice(signature);
         Self { data }
+    }
+
+    /// Creates and signs a node-transfer transaction.
+    ///
+    /// The signing input is the complete transaction byte sequence with the
+    /// signature field zero-filled. The returned owned transaction stores the
+    /// signer-produced 64-byte signature in its signature field.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_signed<Crypto: CryptoTrait>(
+        vote: u32,
+        anchor_sequence: u32,
+        initializer: u32,
+        receiver: u32,
+        amount: u64,
+        fee: u32,
+        comment: u64,
+        crypto: &Crypto,
+    ) -> Self {
+        let zero_signature = [0u8; 64];
+        let mut tx = Self::new(
+            vote,
+            anchor_sequence,
+            initializer,
+            receiver,
+            amount,
+            fee,
+            comment,
+            &zero_signature,
+        );
+        let signature = crypto.sign(&tx.data);
+        tx.data[NODE_TRANSFER_SIGNATURE_OFFSET..NODE_TRANSFER_SIZE]
+            .copy_from_slice(signature.serialize());
+        tx
     }
 
     /// Returns the serialized transaction bytes.
@@ -519,9 +557,45 @@ impl Registration {
         data[13..21].copy_from_slice(&registration_price.to_le_bytes());
         data[21..29].copy_from_slice(&fee.to_le_bytes());
         data[29..61].copy_from_slice(new_public_key);
-        data[61..125].copy_from_slice(new_key_signature);
-        data[125..189].copy_from_slice(signature);
+        data[REGISTRATION_NEW_KEY_SIGNATURE_OFFSET..REGISTRATION_SIGNATURE_OFFSET]
+            .copy_from_slice(new_key_signature);
+        data[REGISTRATION_SIGNATURE_OFFSET..REGISTRATION_SIZE].copy_from_slice(signature);
         Self { data }
+    }
+
+    /// Creates and signs a registration transaction.
+    ///
+    /// The new-key signature signs the new public key bytes. The transaction
+    /// signature then signs the complete transaction bytes with the transaction
+    /// signature field zero-filled and the new-key signature already present.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_signed<Crypto: CryptoTrait>(
+        vote: u32,
+        initializer: u32,
+        new_node_id: u32,
+        registration_price: u64,
+        fee: u64,
+        new_public_key: &[u8; 32],
+        crypto: &Crypto,
+    ) -> Self {
+        let zero_signature = [0u8; 64];
+        let mut tx = Self::new(
+            vote,
+            initializer,
+            new_node_id,
+            registration_price,
+            fee,
+            new_public_key,
+            &zero_signature,
+            &zero_signature,
+        );
+        let new_key_signature = crypto.sign(new_public_key);
+        tx.data[REGISTRATION_NEW_KEY_SIGNATURE_OFFSET..REGISTRATION_SIGNATURE_OFFSET]
+            .copy_from_slice(new_key_signature.serialize());
+        let signature = crypto.sign(&tx.data);
+        tx.data[REGISTRATION_SIGNATURE_OFFSET..REGISTRATION_SIZE]
+            .copy_from_slice(signature.serialize());
+        tx
     }
 
     /// Returns the serialized transaction bytes.
@@ -680,19 +754,11 @@ fn transaction_size(data: &[u8]) -> Option<usize> {
     match data[0] {
         TX_TYPE_NODE_TRANSFER => {
             let size = TX_HEADER_SIZE + NODE_TRANSFER_BODY_SIZE;
-            if data.len() >= size {
-                Some(size)
-            } else {
-                None
-            }
+            if data.len() >= size { Some(size) } else { None }
         }
         TX_TYPE_REGISTRATION => {
             let size = TX_HEADER_SIZE + REGISTRATION_BODY_SIZE;
-            if data.len() >= size {
-                Some(size)
-            } else {
-                None
-            }
+            if data.len() >= size { Some(size) } else { None }
         }
         TX_TYPE_COMPLEX => {
             if data.len() < TX_HEADER_SIZE + 2 {
@@ -743,6 +809,13 @@ fn transaction_size(data: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::block::{BlockBuilder, BlockHeader};
+    use moonblokz_crypto::{Crypto, CryptoTrait, PRIVATE_KEY_SIZE};
+
+    fn test_crypto() -> Crypto {
+        Crypto::new([1u8; PRIVATE_KEY_SIZE])
+            .ok()
+            .expect("test private key should be accepted")
+    }
 
     fn build_tx_block(transactions: &[&[u8]]) -> crate::block::Block {
         let header = BlockHeader {
@@ -761,10 +834,18 @@ mod tests {
         for tx in transactions {
             builder.add_transaction_bytes(tx).unwrap();
         }
-        builder.build().unwrap()
+        builder.build_signed(&test_crypto()).unwrap()
     }
 
-    fn make_node_transfer_bytes(anchor_seq: u32, initializer: u32, receiver: u32, amount: u64, fee: u32, comment: u64, vote: u32) -> [u8; 101] {
+    fn make_node_transfer_bytes(
+        anchor_seq: u32,
+        initializer: u32,
+        receiver: u32,
+        amount: u64,
+        fee: u32,
+        comment: u64,
+        vote: u32,
+    ) -> [u8; 101] {
         let mut buf = [0u8; 101];
         buf[0] = TX_TYPE_NODE_TRANSFER;
         buf[1..5].copy_from_slice(&vote.to_le_bytes());
@@ -819,7 +900,10 @@ mod tests {
             previous_hash: [0; 32],
             signature: [0; 64],
         };
-        let block = BlockBuilder::new().header(header).build().unwrap();
+        let block = BlockBuilder::new()
+            .header(header)
+            .build_signed(&test_crypto())
+            .unwrap();
         assert!(block.transactions().is_none());
     }
 
@@ -913,14 +997,22 @@ mod tests {
         tx_bytes[5] = 1;
         tx_bytes[6] = 1;
         let mut pos = 7;
-        tx_bytes[pos] = INPUT_TYPE_BALANCE; pos += 1;
-        tx_bytes[pos..pos + 4].copy_from_slice(&100u32.to_le_bytes()); pos += 4;
-        tx_bytes[pos..pos + 4].copy_from_slice(&7u32.to_le_bytes()); pos += 4;
-        tx_bytes[pos..pos + 8].copy_from_slice(&3000u64.to_le_bytes()); pos += 8;
-        tx_bytes[pos..pos + 8].copy_from_slice(&99u64.to_le_bytes()); pos += 8;
-        tx_bytes[pos..pos + 64].fill(0x11); pos += 64;
-        tx_bytes[pos] = OUTPUT_TYPE_BALANCE; pos += 1;
-        tx_bytes[pos..pos + 4].copy_from_slice(&8u32.to_le_bytes()); pos += 4;
+        tx_bytes[pos] = INPUT_TYPE_BALANCE;
+        pos += 1;
+        tx_bytes[pos..pos + 4].copy_from_slice(&100u32.to_le_bytes());
+        pos += 4;
+        tx_bytes[pos..pos + 4].copy_from_slice(&7u32.to_le_bytes());
+        pos += 4;
+        tx_bytes[pos..pos + 8].copy_from_slice(&3000u64.to_le_bytes());
+        pos += 8;
+        tx_bytes[pos..pos + 8].copy_from_slice(&99u64.to_le_bytes());
+        pos += 8;
+        tx_bytes[pos..pos + 64].fill(0x11);
+        pos += 64;
+        tx_bytes[pos] = OUTPUT_TYPE_BALANCE;
+        pos += 1;
+        tx_bytes[pos..pos + 4].copy_from_slice(&8u32.to_le_bytes());
+        pos += 4;
         tx_bytes[pos..pos + 8].copy_from_slice(&2500u64.to_le_bytes());
 
         let block = build_tx_block(&[&tx_bytes[..]]);
@@ -1103,7 +1195,10 @@ mod tests {
         assert_eq!(cv.output_count(), 3);
 
         let mut inputs = cv.inputs();
-        assert_eq!(inputs.next().unwrap().as_utxo().unwrap().tr_hash(), &[0x01; 32]);
+        assert_eq!(
+            inputs.next().unwrap().as_utxo().unwrap().tr_hash(),
+            &[0x01; 32]
+        );
         assert_eq!(inputs.next().unwrap().as_utxo().unwrap().output_index(), 1);
         assert!(inputs.next().is_none());
 
