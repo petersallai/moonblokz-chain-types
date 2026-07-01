@@ -26,6 +26,7 @@ via newtype wrappers if needed for diagnostics or testing.
 
 use crate::balance::{BALANCE_HEADER_SIZE, BalanceBlockPayloadView, NodeInfo};
 use crate::error::BlockError;
+use crate::hash::{HASH_SIZE, calculate_hash};
 use crate::transaction::{
     ComplexTransaction, NodeTransfer, Registration, TransactionBlockPayloadView,
 };
@@ -163,6 +164,11 @@ impl<'a> BlockView<'a> {
     /// Returns the canonical serialized bytes that this view borrows from.
     pub fn serialized_bytes(&self) -> &'a [u8] {
         self.bytes
+    }
+
+    /// Returns the canonical block hash.
+    pub fn hash(&self) -> [u8; HASH_SIZE] {
+        calculate_hash(self.bytes)
     }
 
     /// Returns the encoded length in bytes.
@@ -353,6 +359,11 @@ impl Block {
     /// ```
     pub fn serialized_bytes(&self) -> &[u8] {
         &self.data[..self.len]
+    }
+
+    /// Returns the canonical block hash.
+    pub fn hash(&self) -> [u8; HASH_SIZE] {
+        self.view().hash()
     }
 
     /// Returns the encoded length in bytes.
@@ -897,6 +908,18 @@ mod tests {
             .unwrap();
         assert!(block.payload().is_empty());
         assert_eq!(block.len(), HEADER_SIZE);
+    }
+
+    #[test]
+    fn block_hash_methods_use_canonical_bytes() {
+        let block = BlockBuilder::new()
+            .header(sample_header())
+            .build_signed(&test_crypto())
+            .unwrap();
+        let view = block.view();
+
+        assert_eq!(block.hash(), calculate_hash(block.serialized_bytes()));
+        assert_eq!(view.hash(), block.hash());
     }
 
     #[test]

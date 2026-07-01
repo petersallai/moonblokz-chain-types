@@ -30,10 +30,12 @@ Release expectations for crates.io phase:
 
 ## API Overview
 
-- `Block`: immutable block wrapper over fixed-size internal storage.
+- `Block`: immutable block wrapper over fixed-size internal storage; exposes `hash()` for its canonical block hash.
+- `BlockView`: zero-copy borrowed block view; exposes `hash()` over borrowed canonical bytes.
 - `BlockBuilder`: typed builder for constructing `Block` instances.
 - `BlockHeader`: parsed fixed header view.
-- `calculate_hash`: canonical SHA-256 helper used by storage and chain logic.
+- `TransactionView`, `NodeTransfer`, `Registration`, `ComplexTransaction`: expose `hash()` for canonical transaction hashes.
+- `calculate_hash`: canonical SHA-256 helper for raw byte buffers used by lower-level storage and chain logic.
 - Constants:
   - `MAX_BLOCK_SIZE`
   - `HEADER_SIZE`
@@ -54,7 +56,7 @@ Release expectations for crates.io phase:
 ## Basic Example
 
 ```rust
-use moonblokz_chain_types::{BlockBuilder, BlockHeader, calculate_hash, HASH_SIZE};
+use moonblokz_chain_types::{BlockBuilder, BlockHeader, HASH_SIZE};
 
 let header = BlockHeader {
     version: 1,
@@ -74,6 +76,6 @@ let block = BlockBuilder::new()
     .build()
     .unwrap();
 
-let hash = calculate_hash(block.serialized_bytes());
+let hash = block.hash();
 assert_eq!(hash.len(), HASH_SIZE);
 ```

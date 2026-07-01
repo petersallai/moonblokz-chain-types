@@ -200,9 +200,10 @@ representation.
 
 ## Hashing
 
-- Hashing is provided by `calculate_hash(&[u8]) -> [u8; HASH_SIZE]` (SHA-256).
+- Canonical chain objects expose inherent `hash()` methods: `Block::hash()`, `BlockView::hash()`, `TransactionView::hash()`, and the owned transaction builders' `hash()` methods.
+- Raw-byte hashing remains available as `calculate_hash(&[u8]) -> [u8; HASH_SIZE]` (SHA-256) for lower-level storage buffers and other non-typed byte regions.
 - `previous_hash` is the hash of the previous block including header and payload.
-- Callers typically hash `block.serialized_bytes()`.
+- Block callers should normally use `block.hash()` / `block_view.hash()` instead of re-hashing `serialized_bytes()` at each call site.
 
 ## Radio Packetization
 

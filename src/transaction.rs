@@ -7,6 +7,7 @@ owned byte arrays for constructing transactions before adding them to a block.
 
 use crate::block::{MAX_PAYLOAD_SIZE, read_u32_le, read_u64_le};
 use crate::error::BlockError;
+use crate::hash::{HASH_SIZE, calculate_hash};
 use moonblokz_crypto::{CryptoTrait, SignatureTrait};
 
 // Transaction type discriminators.
@@ -110,6 +111,47 @@ pub struct TransactionView<'a> {
 }
 
 impl<'a> TransactionView<'a> {
+    /// Constructs a borrowed view over standalone transaction bytes
+    /// (e.g., mempool entries that don't live inside a block payload).
+    ///
+    /// Validates the structural invariant — `tx_type` is one of the known
+    /// discriminators, and `bytes.len()` matches the fixed-size kinds —
+    /// without copying. Returns `None` on malformed input.
+    pub fn from_bytes(bytes: &'a [u8]) -> Option<Self> {
+        if bytes.is_empty() {
+            return None;
+        }
+        match bytes[0] {
+            TX_TYPE_NODE_TRANSFER if bytes.len() == NODE_TRANSFER_SIZE => {
+                Some(Self { data: bytes })
+            }
+            TX_TYPE_REGISTRATION if bytes.len() == REGISTRATION_SIZE => Some(Self { data: bytes }),
+            TX_TYPE_COMPLEX if transaction_size(bytes) == Some(bytes.len()) => {
+                Some(Self { data: bytes })
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns the borrowed serialized transaction bytes.
+    pub fn as_bytes(&self) -> &'a [u8] {
+        self.data
+    }
+
+    /// Returns the canonical transaction hash.
+    pub fn hash(&self) -> [u8; HASH_SIZE] {
+        calculate_hash(self.data)
+    }
+
+    /// Returns the serialized transaction length in bytes.
+    //
+    // A valid `TransactionView` always spans at least `TX_HEADER_SIZE` bytes,
+    // so it can never be empty. An `is_empty()` method would be misleading.
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
     /// Transaction type discriminator (`1` = node transfer, `2` = registration, `3` = complex).
     pub fn tx_type(&self) -> u8 {
         self.data[0]
@@ -529,6 +571,11 @@ impl NodeTransfer {
     pub fn as_bytes(&self) -> &[u8] {
         &self.data
     }
+
+    /// Returns the canonical transaction hash.
+    pub fn hash(&self) -> [u8; HASH_SIZE] {
+        calculate_hash(&self.data)
+    }
 }
 
 /// Owned registration transaction for block construction (189 bytes).
@@ -601,6 +648,11 @@ impl Registration {
     /// Returns the serialized transaction bytes.
     pub fn as_bytes(&self) -> &[u8] {
         &self.data
+    }
+
+    /// Returns the canonical transaction hash.
+    pub fn hash(&self) -> [u8; HASH_SIZE] {
+        calculate_hash(&self.data)
     }
 }
 
@@ -740,6 +792,11 @@ impl ComplexTransaction {
     pub fn as_bytes(&self) -> &[u8] {
         &self.data[..self.len]
     }
+
+    /// Returns the canonical transaction hash.
+    pub fn hash(&self) -> [u8; HASH_SIZE] {
+        calculate_hash(&self.data[..self.len])
+    }
 }
 
 // =======================================================================
@@ -860,6 +917,41 @@ mod tests {
     }
 
     // -- View tests --
+
+    #[test]
+    fn transaction_view_from_bytes_rejects_malformed_complex() {
+        let too_short_for_counts = [TX_TYPE_COMPLEX, 0, 0, 0, 0];
+        assert!(TransactionView::from_bytes(&too_short_for_counts).is_none());
+
+        let missing_declared_input = [TX_TYPE_COMPLEX, 0, 0, 0, 0, 1, 0];
+        assert!(TransactionView::from_bytes(&missing_declared_input).is_none());
+
+        let valid_empty_complex = ComplexTransaction::new(42);
+        assert!(TransactionView::from_bytes(valid_empty_complex.as_bytes()).is_some());
+    }
+
+    #[test]
+    fn transaction_hash_methods_use_canonical_bytes() {
+        let sig = [0xAA; 64];
+        let nt = NodeTransfer::new(99, 10, 1, 2, 1000, 5, 42, &sig);
+        let nt_view = TransactionView::from_bytes(nt.as_bytes()).unwrap();
+        assert_eq!(nt.hash(), calculate_hash(nt.as_bytes()));
+        assert_eq!(nt_view.hash(), nt.hash());
+
+        let public_key = [0xBB; 32];
+        let key_sig = [0xCC; 64];
+        let reg = Registration::new(50, 1, 42, 1000, 10, &public_key, &key_sig, &sig);
+        let reg_view = TransactionView::from_bytes(reg.as_bytes()).unwrap();
+        assert_eq!(reg.hash(), calculate_hash(reg.as_bytes()));
+        assert_eq!(reg_view.hash(), reg.hash());
+
+        let mut complex = ComplexTransaction::new(7);
+        complex.add_balance_input(10, 1, 1000, 0, &sig).unwrap();
+        complex.add_balance_output(2, 900).unwrap();
+        let complex_view = TransactionView::from_bytes(complex.as_bytes()).unwrap();
+        assert_eq!(complex.hash(), calculate_hash(complex.as_bytes()));
+        assert_eq!(complex_view.hash(), complex.hash());
+    }
 
     #[test]
     fn node_transfer_view_round_trip() {
