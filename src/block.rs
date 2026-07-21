@@ -569,6 +569,36 @@ impl BlockBuilder {
         self.append_item(bytes)
     }
 
+    /// Sets the chain-config payload from its raw binary form.
+    ///
+    /// Unlike the transaction/balance builders, a chain-config
+    /// (`PAYLOAD_TYPE_CHAIN_CONFIG`) block carries the config bytes *verbatim*
+    /// with no leading item-count framing — the single structural fact
+    /// (`block == [header | payload]`) that chain-config content-matching relies
+    /// on. This sets `payload_type` to `PAYLOAD_TYPE_CHAIN_CONFIG` and must be the
+    /// only payload-setting call on the builder; an empty `bytes` slice yields a
+    /// header-only chain-config block. Because the payload is signed as part of
+    /// `build_signed`'s canonical bytes, this produces a Block #1 whose signature
+    /// covers its chain-config content (the genesis FR54 second block).
+    pub fn set_chain_config_payload(&mut self, bytes: &[u8]) -> Result<&mut Self, BlockError> {
+        if self.payload_len != 0 {
+            return Err(BlockError::MalformedBlock("payload type mismatch"));
+        }
+        if self.header.payload_type != 0 && self.header.payload_type != PAYLOAD_TYPE_CHAIN_CONFIG {
+            return Err(BlockError::MalformedBlock("payload type mismatch"));
+        }
+        if bytes.len() > MAX_PAYLOAD_SIZE {
+            return Err(BlockError::PayloadTooLarge {
+                max: MAX_PAYLOAD_SIZE,
+                actual: bytes.len(),
+            });
+        }
+        self.header.payload_type = PAYLOAD_TYPE_CHAIN_CONFIG;
+        self.payload[..bytes.len()].copy_from_slice(bytes);
+        self.payload_len = bytes.len();
+        Ok(self)
+    }
+
     /// Adds a node-info balance entry to the block payload.
     ///
     /// The payload type is automatically set to `PAYLOAD_TYPE_BALANCE` on the
@@ -908,6 +938,68 @@ mod tests {
             .unwrap();
         assert!(block.payload().is_empty());
         assert_eq!(block.len(), HEADER_SIZE);
+    }
+
+    #[test]
+    fn set_chain_config_payload_round_trips_verbatim() {
+        let header = BlockHeader {
+            version: 1,
+            sequence: 1,
+            creator: 0,
+            mined_amount: 0,
+            payload_type: 0,
+            consumed_votes: 0,
+            first_voted_node: 0,
+            consumed_votes_from_first_voted_node: 0,
+            previous_hash: [0x42; 32],
+            signature: [0u8; 64],
+        };
+        let config_bytes = [0xC0, 0xA5, 0xF6, 0x01, 0x02, 0x03];
+        let mut builder = BlockBuilder::new().header(header);
+        builder.set_chain_config_payload(&config_bytes).unwrap();
+        let block = builder.build_signed(&test_crypto()).unwrap();
+
+        assert_eq!(block.payload_type(), PAYLOAD_TYPE_CHAIN_CONFIG);
+        // Chain-config payload is the raw bytes verbatim — no item framing.
+        assert_eq!(block.payload(), &config_bytes[..]);
+        assert_eq!(block.previous_hash(), &[0x42; 32][..]);
+        assert!(any_nonzero(block.signature()), "block must be signed");
+        assert_eq!(block.len(), HEADER_SIZE + config_bytes.len());
+    }
+
+    #[test]
+    fn set_chain_config_payload_empty_yields_header_only() {
+        let mut builder = BlockBuilder::new().header(sample_header());
+        builder.set_chain_config_payload(&[]).unwrap();
+        let block = builder.build_signed(&test_crypto()).unwrap();
+
+        assert_eq!(block.payload_type(), PAYLOAD_TYPE_CHAIN_CONFIG);
+        assert!(block.payload().is_empty());
+        assert_eq!(block.len(), HEADER_SIZE);
+    }
+
+    #[test]
+    fn set_chain_config_payload_rejects_oversized() {
+        let oversized = [0u8; MAX_PAYLOAD_SIZE + 1];
+        let mut builder = BlockBuilder::new().header(sample_header());
+        assert!(matches!(
+            builder.set_chain_config_payload(&oversized),
+            Err(BlockError::PayloadTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn set_chain_config_payload_rejects_type_mismatch() {
+        // A builder that already holds transaction items rejects a later
+        // chain-config payload call.
+        let signer = test_crypto();
+        let tx = crate::NodeTransfer::new_signed(0, 0, 0, 0, 1, 0, 0, &signer);
+        let mut builder = BlockBuilder::new();
+        builder.add_node_transfer(&tx).unwrap();
+        assert!(matches!(
+            builder.set_chain_config_payload(&[0x01]),
+            Err(BlockError::MalformedBlock(_))
+        ));
     }
 
     #[test]
