@@ -26,6 +26,7 @@ compile_error!(
 
 pub mod balance;
 pub mod block;
+pub mod chain_config;
 pub mod error;
 pub mod hash;
 pub mod transaction;
@@ -44,6 +45,10 @@ pub use block::{
     Block, BlockBuilder, BlockHeader, BlockView, HEADER_SIZE, MAX_BLOCK_SIZE, MAX_PAYLOAD_SIZE,
     PAYLOAD_TYPE_APPROVAL, PAYLOAD_TYPE_BALANCE, PAYLOAD_TYPE_CHAIN_CONFIG,
     PAYLOAD_TYPE_TRANSACTION,
+};
+pub use chain_config::{
+    CONFIG_KEY_BYTECODE_FLAG, CONFIG_PARAMETER_ID_MAX, CONFIG_VALUE_COUNT_SIZE,
+    ChainConfigBlockPayloadView, ChainConfigPayloadBuilder, ConfigValueIterator, ConfigValueView,
 };
 pub use error::BlockError;
 pub use hash::{HASH_SIZE, calculate_hash};
