@@ -259,7 +259,7 @@ impl ChainConfigPayloadBuilder {
     /// parameter's declared width is a registry question, checked by
     /// `moonblokz-configuration`.
     pub fn add_literal(&mut self, parameter_id: u8, value: &[u8]) -> Result<&mut Self, BlockError> {
-        self.add_entry(parameter_id, value)
+        self.add_entry(parameter_id, false, value)
     }
 
     /// Appends a bytecode-valued entry.
@@ -268,16 +268,31 @@ impl ChainConfigPayloadBuilder {
         parameter_id: u8,
         program: &[u8],
     ) -> Result<&mut Self, BlockError> {
-        self.add_entry(parameter_id | CONFIG_KEY_BYTECODE_FLAG, program)
+        self.add_entry(parameter_id, true, program)
     }
 
-    fn add_entry(&mut self, key_byte: u8, value: &[u8]) -> Result<&mut Self, BlockError> {
-        if !is_valid_key_byte(key_byte) {
+    /// The value form is a separate argument rather than bit 7 of `parameter_id`,
+    /// and `parameter_id` is range-checked *before* any masking. Validating the
+    /// masked byte instead would accept `add_literal(129, …)` — identifier 1 with
+    /// the flag bit set — and frame it as a **bytecode** entry the caller never
+    /// asked for, permanently, under a signature.
+    fn add_entry(
+        &mut self,
+        parameter_id: u8,
+        bytecode: bool,
+        value: &[u8],
+    ) -> Result<&mut Self, BlockError> {
+        if parameter_id == 0 || parameter_id > CONFIG_PARAMETER_ID_MAX {
             return Err(BlockError::MalformedBlock(
                 "chain-config parameter identifier out of range",
             ));
         }
-        let id_bit = 1u128 << parameter_id_of(key_byte);
+        let key_byte = if bytecode {
+            parameter_id | CONFIG_KEY_BYTECODE_FLAG
+        } else {
+            parameter_id
+        };
+        let id_bit = 1u128 << parameter_id;
         if self.seen & id_bit != 0 {
             return Err(BlockError::MalformedBlock(
                 "duplicate chain-config parameter identifier",
@@ -450,9 +465,18 @@ mod tests {
 
     #[test]
     fn payload_shorter_than_count_and_signature_is_malformed() {
+        // One byte short of the minimum, and otherwise well formed: `count == 0`
+        // means the walk stops immediately at `content_end == 2`, so only the
+        // length guard can reject this.
         let short = [0u8; CONFIG_VALUE_COUNT_SIZE + SIGNATURE_SIZE - 1];
         let block = block_with_payload(&short);
         assert!(block.view().chain_config().is_none());
+
+        // The minimum itself is accepted, which is what makes the guard's boundary
+        // the tested property rather than its direction.
+        let minimum = [0u8; CONFIG_VALUE_COUNT_SIZE + SIGNATURE_SIZE];
+        let block = block_with_payload(&minimum);
+        assert!(block.view().chain_config().is_some());
     }
 
     #[test]
@@ -521,8 +545,28 @@ mod tests {
 
     #[test]
     fn declared_count_beyond_the_entries_is_malformed() {
+        // Two entries declared, one written, and the tail is a *valid* second key
+        // byte followed by the signature region — so the walk cannot fail on the
+        // key byte and has to fail on the bound. (A zero-filled tail would be
+        // rejected by the key-byte check instead, leaving the bound untested.)
         let mut payload = [0u8; CONFIG_VALUE_COUNT_SIZE + 3 + SIGNATURE_SIZE];
         payload[0..2].copy_from_slice(&2u16.to_le_bytes());
+        payload[2] = 0x01;
+        payload[3] = 1;
+        payload[4] = 42;
+        payload[5] = 0x02;
+        payload[6] = SIGNATURE_SIZE as u8;
+
+        let block = block_with_payload(&payload);
+        assert!(block.view().chain_config().is_none());
+    }
+
+    #[test]
+    fn a_count_that_runs_the_walk_past_the_payload_is_malformed() {
+        // The declared count is larger than any number of entries the payload
+        // could hold, so the walk exhausts the buffer mid-entry.
+        let mut payload = [0u8; CONFIG_VALUE_COUNT_SIZE + 3 + SIGNATURE_SIZE];
+        payload[0..2].copy_from_slice(&u16::MAX.to_le_bytes());
         payload[2] = 0x01;
         payload[3] = 1;
         payload[4] = 42;
@@ -539,6 +583,26 @@ mod tests {
         assert!(builder.add_literal(0, &[1]).is_err());
         assert!(builder.add_literal(127, &[1]).is_err());
         assert!(builder.add_bytecode(127, &[1]).is_err());
+        assert_eq!(builder.content().len(), CONFIG_VALUE_COUNT_SIZE);
+    }
+
+    #[test]
+    fn builder_rejects_a_parameter_id_carrying_the_form_flag() {
+        // The whole `0x80..=0xFF` input class: were the identifier range-checked
+        // after masking, `add_literal(129, ..)` would frame identifier 1 as
+        // *bytecode* — a value form the caller never asked for, signed into the
+        // chain. Nothing downstream could tell it from an intentional program.
+        let mut builder = ChainConfigPayloadBuilder::new();
+        for parameter_id in 0x80u8..=0xFF {
+            assert!(
+                builder.add_literal(parameter_id, &[1]).is_err(),
+                "add_literal({parameter_id:#04X}) must be refused"
+            );
+            assert!(
+                builder.add_bytecode(parameter_id, &[1]).is_err(),
+                "add_bytecode({parameter_id:#04X}) must be refused"
+            );
+        }
         assert_eq!(builder.content().len(), CONFIG_VALUE_COUNT_SIZE);
     }
 
