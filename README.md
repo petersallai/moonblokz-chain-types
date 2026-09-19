@@ -35,6 +35,7 @@ Release expectations for crates.io phase:
 - `BlockBuilder`: typed builder for constructing `Block` instances.
 - `BlockHeader`: parsed fixed header view.
 - `TransactionView`, `NodeTransfer`, `Registration`, `ComplexTransaction`: expose `hash()` for canonical transaction hashes.
+- `ChainConfigBlockPayloadView`, `ChainConfigPayloadBuilder`: chain-config payload envelope — content region, node-#0 content signature, and entry framing. Parameter semantics belong to `moonblokz-configuration`.
 - `calculate_hash`: canonical SHA-256 helper for raw byte buffers used by lower-level storage and chain logic.
 - Constants:
   - `MAX_BLOCK_SIZE`

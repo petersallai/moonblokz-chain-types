@@ -169,9 +169,45 @@ Simpler structure than transactions, allowing more entries per block.
 
 ### 3 — Chain Configuration
 
-Outlines a list of configuration parameters. The available configuration points
-and dynamic formulas used as configuration values are covered in a separate
-article.
+Carries the chain's configuration content: a set of parameter overrides, signed
+by node #0.
+
+**Payload layout:**
+
+| Field | Type | Description |
+|---|---|---|
+| `config_value_count` | `u16` | Number of override entries. |
+| `config_values` | `count × entry` | The entries, back-to-back with no padding. |
+| `content_signature` | `[u8; SIGNATURE_SIZE]` | Node #0's signature over the content region. |
+
+**Per entry:**
+
+| Field | Type | Description |
+|---|---|---|
+| `key_byte` | `u8` | Bit 7 selects the value form (clear = literal, set = bytecode); bits 0–6 carry the parameter identifier. |
+| `value_length` | `u8` | Value length in bytes — hence a bytecode program is at most 255 bytes. |
+| `value` | `value_length` bytes | Literal value (little-endian scalars, arrays verbatim) or bytecode program. |
+
+The **content region** is `config_value_count` plus every entry —
+`payload[..content_end]` — and is the canonical byte sequence node #0 signs.
+`content_end` is *derived* by walking the entries, never read from a fixed
+offset; that is what makes truncation and trailing padding detectable.
+
+Key bytes `0x00`, `0x7F`, `0x80` and `0xFF` are all invalid: the usable
+parameter-identifier range is `1..=126`. Identifier `127` is permanently
+unallocated because its bytecode form would be `0xFF`, which is reserved as a
+multi-byte-key escape (recorded as a forward-extension path, treated as
+malformed today).
+
+A payload is malformed when it is shorter than `2 + SIGNATURE_SIZE`, when a
+`value_length` runs past the end, when
+`content_end + SIGNATURE_SIZE != payload.len()`, when a parameter identifier
+appears twice in either value form, or when a key byte is outside the usable
+range. `BlockView::chain_config()` returns `None` in each case.
+
+What an identifier *means* — its width, its default, whether its value may be a
+program — is not part of this layout: the parameter registry lives in
+`moonblokz-configuration`, and nothing in this crate interprets a key.
 
 ### 4 — Approval (Evidence)
 

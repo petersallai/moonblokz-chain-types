@@ -25,6 +25,7 @@ via newtype wrappers if needed for diagnostics or testing.
 */
 
 use crate::balance::{BALANCE_HEADER_SIZE, BalanceBlockPayloadView, NodeInfo};
+use crate::chain_config::ChainConfigBlockPayloadView;
 use crate::error::BlockError;
 use crate::hash::{HASH_SIZE, calculate_hash};
 use crate::transaction::{
@@ -249,6 +250,15 @@ impl<'a> BlockView<'a> {
             return None;
         }
         BalanceBlockPayloadView::new(self.payload())
+    }
+
+    /// Returns a chain-config block payload view if `payload_type() == 3` and the
+    /// envelope framing is well formed.
+    pub fn chain_config(&self) -> Option<ChainConfigBlockPayloadView<'a>> {
+        if self.bytes[PAYLOAD_TYPE_OFFSET] != PAYLOAD_TYPE_CHAIN_CONFIG {
+            return None;
+        }
+        ChainConfigBlockPayloadView::from_payload(self.payload())
     }
 }
 
