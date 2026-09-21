@@ -91,46 +91,20 @@ impl<'a> ChainConfigBlockPayloadView<'a> {
     /// ever reached through a block — because the configuration module retains a
     /// bare payload and re-reads its entries without a block around it.
     pub fn from_payload(payload: &'a [u8]) -> Option<Self> {
-        if payload.len() < CONFIG_VALUE_COUNT_SIZE + moonblokz_crypto::SIGNATURE_SIZE {
-            return None;
-        }
+        let content_len = content_end(payload)?;
 
-        let count = u16::from_le_bytes([payload[0], payload[1]]);
-        // One bit per usable identifier (1..=126): a duplicate in either value
-        // form is malformed, so the flag bit is masked off before the test.
-        let mut seen: u128 = 0;
-        let mut offset = CONFIG_VALUE_COUNT_SIZE;
-
-        for _ in 0..count {
-            if offset + 2 > payload.len() {
-                return None;
-            }
-            let key_byte = payload[offset];
-            if !is_valid_key_byte(key_byte) {
-                return None;
-            }
-            let id_bit = 1u128 << parameter_id_of(key_byte);
-            if seen & id_bit != 0 {
-                return None;
-            }
-            seen |= id_bit;
-
-            offset += 2 + payload[offset + 1] as usize;
-            if offset > payload.len() {
-                return None;
-            }
-        }
-
-        // `content_end` is where the walk stopped. Anything else in the payload
-        // must be exactly the signature: a shorter or longer remainder is
-        // truncation or padding, and both change the signed byte sequence.
-        if offset + moonblokz_crypto::SIGNATURE_SIZE != payload.len() {
+        // Anything past the content region must be exactly the signature: a
+        // shorter or longer remainder is truncation or padding, and both change
+        // the signed byte sequence. This strictness is what makes the envelope
+        // exact, and it is why `content_end` is factored out rather than
+        // relaxed — a padded read-back needs the walk without this test.
+        if content_len + moonblokz_crypto::SIGNATURE_SIZE != payload.len() {
             return None;
         }
 
         Some(Self {
             payload,
-            content_len: offset,
+            content_len,
         })
     }
 
@@ -157,6 +131,57 @@ impl<'a> ChainConfigBlockPayloadView<'a> {
             remaining: self.count(),
         }
     }
+}
+
+/// Walks the envelope's entries and returns where the content region ends —
+/// the offset at which the node-#0 content signature begins.
+///
+/// Padding-tolerant by construction: it validates the walk against the buffer
+/// it is given but does **not** require the buffer to end where the signature
+/// does. [`ChainConfigBlockPayloadView::from_payload`] adds that exact-length
+/// test; a block read back from durable storage arrives zero-padded to a fixed
+/// slot with no recorded length, and needs the walk without it (FR59).
+///
+/// Returns `None` on a malformed envelope: an out-of-range or duplicated
+/// identifier, a declared value length that over-runs the buffer, or a content
+/// region with no room for the signature after it.
+pub(crate) fn content_end(payload: &[u8]) -> Option<usize> {
+    if payload.len() < CONFIG_VALUE_COUNT_SIZE + moonblokz_crypto::SIGNATURE_SIZE {
+        return None;
+    }
+
+    let count = u16::from_le_bytes([payload[0], payload[1]]);
+    // One bit per usable identifier (1..=126): a duplicate in either value
+    // form is malformed, so the flag bit is masked off before the test.
+    let mut seen: u128 = 0;
+    let mut offset = CONFIG_VALUE_COUNT_SIZE;
+
+    for _ in 0..count {
+        if offset + 2 > payload.len() {
+            return None;
+        }
+        let key_byte = payload[offset];
+        if !is_valid_key_byte(key_byte) {
+            return None;
+        }
+        let id_bit = 1u128 << parameter_id_of(key_byte);
+        if seen & id_bit != 0 {
+            return None;
+        }
+        seen |= id_bit;
+
+        offset += 2 + payload[offset + 1] as usize;
+        if offset > payload.len() {
+            return None;
+        }
+    }
+
+    // The signature has to fit after the content region, whatever follows it.
+    if offset + moonblokz_crypto::SIGNATURE_SIZE > payload.len() {
+        return None;
+    }
+
+    Some(offset)
 }
 
 /// Zero-copy iterator over the entries of a chain-config content region.

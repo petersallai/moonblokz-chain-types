@@ -236,6 +236,59 @@ impl<'a> BlockView<'a> {
         &self.bytes[PAYLOAD_OFFSET..self.bytes.len()]
     }
 
+    /// Recovers the block's **exact** serialized byte length by walking its
+    /// self-delimiting payload structurally.
+    ///
+    /// This is not [`Self::len`]. `len()` reports how long the borrowed slice
+    /// is; `content_length()` reports how long the block actually is. The two
+    /// agree for a block parsed from its wire bytes and diverge for one read
+    /// back from durable storage, which arrives zero-padded to a fixed slot
+    /// with no recorded length. Recovering the exact length is what lets a
+    /// restarting node recompute the block hash and re-verify the creator
+    /// signature over the bytes that were originally signed (FR59) — both are
+    /// taken over `bytes[..content_length()]`, so a padded slice silently
+    /// produces the wrong answer for each.
+    ///
+    /// The walk is **count-based and structural**, never a trailing-zero scan:
+    /// a block's real content may legitimately end in zero bytes. It returns
+    /// `None` rather than guessing whenever the payload does not frame
+    /// coherently — an unknown payload type or transaction discriminant, a
+    /// declared count that over-runs the buffer, or a computed length beyond
+    /// the slice.
+    ///
+    /// `payload_type == 4` (approval evidence) has no wire format defined
+    /// anywhere yet, so its length is undecidable in general. Only the empty
+    /// payload — the sole shape constructible today — is answered, and any
+    /// non-zero approval payload yields `None`. When Epic 6 (FR12/FR27) defines
+    /// the approval framing it **must** extend this arm; until it does, a
+    /// restart refuses to recover such a block's length rather than silently
+    /// truncating it to a header and computing a wrong hash.
+    pub fn content_length(&self) -> Option<usize> {
+        let payload = self.payload();
+        let payload_len = match self.payload_type() {
+            PAYLOAD_TYPE_TRANSACTION => crate::transaction::payload_content_len(payload)?,
+            PAYLOAD_TYPE_BALANCE => crate::balance::payload_content_len(payload)?,
+            PAYLOAD_TYPE_CHAIN_CONFIG => crate::chain_config::content_end(payload)?
+                .checked_add(moonblokz_crypto::SIGNATURE_SIZE)?,
+            // FR12/FR27 — Epic 6 must extend this arm when the approval payload
+            // gains a format. Answering `HEADER_SIZE` for a non-empty payload
+            // would be a guess, and a wrong block hash is worse than a refusal.
+            PAYLOAD_TYPE_APPROVAL => {
+                if payload.iter().any(|byte| *byte != 0) {
+                    return None;
+                }
+                0
+            }
+            _ => return None,
+        };
+
+        let total = HEADER_SIZE.checked_add(payload_len)?;
+        if total > self.bytes.len() {
+            return None;
+        }
+        Some(total)
+    }
+
     /// Returns a transaction block payload view if `payload_type() == 1`.
     pub fn transactions(&self) -> Option<TransactionBlockPayloadView<'a>> {
         if self.bytes[PAYLOAD_TYPE_OFFSET] != PAYLOAD_TYPE_TRANSACTION {
@@ -383,6 +436,16 @@ impl Block {
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    /// Recovers the block's exact serialized byte length structurally — see
+    /// [`BlockView::content_length`].
+    ///
+    /// For a `Block` built from exact wire bytes this equals [`Self::len`]. For
+    /// one returned by a storage backend it does not: `len()` is then the padded
+    /// slot width, and this is the block.
+    pub fn content_length(&self) -> Option<usize> {
+        self.view().content_length()
     }
 
     /// Block version. `0` is reserved for storage empty-slot markers.
@@ -816,6 +879,9 @@ mod tests {
     use moonblokz_crypto::{Crypto, CryptoTrait, PRIVATE_KEY_SIZE};
 
     fn test_crypto() -> Crypto {
+        // `CryptoError` has no `Debug` even under test, so `.expect()` cannot be
+        // called on the `Result` directly — unlike `BlockError`, which does
+        // derive it (`error.rs`). Hence `.ok()` first.
         Crypto::new([1u8; PRIVATE_KEY_SIZE])
             .ok()
             .expect("test private key should be accepted")
@@ -838,6 +904,253 @@ mod tests {
             previous_hash: [9u8; 32],
             signature: [5u8; 64],
         }
+    }
+
+    // ===================================================================
+    // `content_length` — exact-length recovery from a padded read-back
+    // (FR59). Every test below parses the block from a **padded** buffer,
+    // because that is the only shape the problem actually occurs in.
+    // ===================================================================
+
+    /// Simulates a durable read-back: the exact bytes, zero-padded out to the
+    /// fixed slot width, exactly as `MemoryBackend::read_block` returns them.
+    fn padded_slot(block: &Block) -> [u8; MAX_BLOCK_SIZE] {
+        let mut slot = [0u8; MAX_BLOCK_SIZE];
+        let exact = block.serialized_bytes();
+        slot[..exact.len()].copy_from_slice(exact);
+        slot
+    }
+
+    /// Asserts the round trip that FR59 depends on: after padding, the slice
+    /// length is the slot width and only `content_length()` still knows the
+    /// block — and trimming to it reproduces the original bytes *and hash*.
+    fn assert_recovers(block: &Block) {
+        let exact = block.serialized_bytes();
+        let slot = padded_slot(block);
+        let read_back = Block::from_bytes(&slot).expect("padded slot parses");
+
+        assert_eq!(
+            read_back.len(),
+            MAX_BLOCK_SIZE,
+            "precondition: read-back is padded"
+        );
+        let recovered = read_back
+            .content_length()
+            .expect("content_length recovers a well-framed block");
+        assert_eq!(
+            recovered,
+            exact.len(),
+            "recovered length must equal the wire length"
+        );
+
+        let view = BlockView::from_bytes(&slot[..recovered]).expect("trimmed view parses");
+        assert_eq!(
+            view.serialized_bytes(),
+            exact,
+            "trimmed bytes must be the original bytes"
+        );
+        assert_eq!(
+            view.hash(),
+            block.view().hash(),
+            "trimmed hash must be the real hash"
+        );
+        assert_ne!(
+            read_back.hash(),
+            block.view().hash(),
+            "the padded hash must differ - that is the bug this prevents"
+        );
+    }
+
+    /// Copies a freshly signed chain-config payload into a fixed buffer — the
+    /// crate is `no_std`, so tests carry arrays, not `Vec`s. Mirrors
+    /// `chain_config::tests::signed_payload_bytes`.
+    fn signed_config_payload(
+        builder: &mut crate::chain_config::ChainConfigPayloadBuilder,
+    ) -> ([u8; MAX_PAYLOAD_SIZE], usize) {
+        let mut bytes = [0u8; MAX_PAYLOAD_SIZE];
+        let signed = builder.build_signed(&test_crypto());
+        bytes[..signed.len()].copy_from_slice(signed);
+        (bytes, signed.len())
+    }
+
+    fn transaction_block_with_signature(tx_signature: &[u8; 64]) -> Block {
+        let nt = NodeTransfer::new(99, 10, 1, 2, 1000, 5, 42, tx_signature);
+        let mut builder = BlockBuilder::new().header(BlockHeader {
+            payload_type: 0,
+            ..sample_header()
+        });
+        builder.add_node_transfer(&nt).unwrap();
+        builder.build_signed(&test_crypto()).unwrap()
+    }
+
+    #[test]
+    fn content_length_recovers_a_transaction_block() {
+        assert_recovers(&transaction_block_with_signature(&[0xAA; 64]));
+    }
+
+    #[test]
+    fn content_length_recovers_a_balance_block() {
+        let ni = NodeInfo::new(3, 5000, 12, &[7u8; 32]);
+        let mut builder = BlockBuilder::new().header(BlockHeader {
+            payload_type: 0,
+            ..sample_header()
+        });
+        builder.add_node_info(&ni).unwrap();
+        builder.set_max_node_id(9).unwrap();
+        assert_recovers(&builder.build_signed(&test_crypto()).unwrap());
+    }
+
+    #[test]
+    fn content_length_recovers_a_chain_config_block() {
+        let mut payload_builder = crate::chain_config::ChainConfigPayloadBuilder::new();
+        payload_builder.add_literal(21, &[100, 0]).unwrap();
+        payload_builder.add_literal(7, &[1, 2, 3]).unwrap();
+        let (payload_bytes, payload_len) = signed_config_payload(&mut payload_builder);
+        let payload = &payload_bytes[..payload_len];
+
+        let mut builder = BlockBuilder::new().header(BlockHeader {
+            payload_type: PAYLOAD_TYPE_CHAIN_CONFIG,
+            ..sample_header()
+        });
+        builder.set_chain_config_payload(payload).unwrap();
+        assert_recovers(&builder.build_signed(&test_crypto()).unwrap());
+    }
+
+    #[test]
+    fn content_length_recovers_a_complex_transaction_with_mixed_item_types() {
+        let sig = [0x5A; 64];
+        let mut cx = ComplexTransaction::new(4);
+        cx.add_utxo_input(&[1u8; 32], 2, &sig).unwrap();
+        cx.add_balance_input(7, 3, 900, 0, &sig).unwrap();
+        cx.add_utxo_output(&[2u8; 32], 400).unwrap();
+        cx.add_balance_output(5, 500).unwrap();
+
+        let mut builder = BlockBuilder::new().header(BlockHeader {
+            payload_type: 0,
+            ..sample_header()
+        });
+        builder.add_complex_transaction(&cx).unwrap();
+        let block = builder.build_signed(&test_crypto()).unwrap();
+
+        // 5 (tx header) + 2 (counts) + 98 + 89 + 41 + 13 = 248, + the 2-byte
+        // payload transaction count, + the block header.
+        assert_eq!(block.len(), HEADER_SIZE + 2 + 248);
+        assert_recovers(&block);
+    }
+
+    /// The case that rules out a trailing-zero scan: the block's own last
+    /// content byte is `0x00`, so "walk back over the zeros" would truncate a
+    /// legitimate block and compute a wrong hash.
+    #[test]
+    fn content_length_is_not_fooled_by_content_ending_in_zero() {
+        let mut tx_signature = [0xAA; 64];
+        tx_signature[63] = 0;
+        let block = transaction_block_with_signature(&tx_signature);
+        assert_eq!(*block.serialized_bytes().last().unwrap(), 0);
+        assert_recovers(&block);
+    }
+
+    /// Same hazard on the chain-config walk: the final entry's value ends in a
+    /// zero byte, inside the signed content region.
+    #[test]
+    fn content_length_is_not_fooled_by_a_chain_config_value_ending_in_zero() {
+        let mut payload_builder = crate::chain_config::ChainConfigPayloadBuilder::new();
+        payload_builder.add_literal(21, &[5, 0, 0]).unwrap();
+        let (payload_bytes, payload_len) = signed_config_payload(&mut payload_builder);
+        let payload = &payload_bytes[..payload_len];
+
+        let mut builder = BlockBuilder::new().header(BlockHeader {
+            payload_type: PAYLOAD_TYPE_CHAIN_CONFIG,
+            ..sample_header()
+        });
+        builder.set_chain_config_payload(payload).unwrap();
+        assert_recovers(&builder.build_signed(&test_crypto()).unwrap());
+    }
+
+    /// A zero-item payload is `HEADER_SIZE + count field` — and a padded slot
+    /// decodes its zero padding as exactly that, so the two are structurally
+    /// indistinguishable. Tier 1 rejects header-only type-1/2 blocks (their
+    /// payload views require the count field), so no such block can reach
+    /// durable storage and the ambiguity is unreachable in practice.
+    #[test]
+    fn content_length_of_empty_transaction_and_balance_payloads() {
+        let empty_tx = BlockBuilder::new()
+            .header(BlockHeader {
+                payload_type: PAYLOAD_TYPE_TRANSACTION,
+                ..sample_header()
+            })
+            .build_signed(&test_crypto())
+            .unwrap();
+        let slot = padded_slot(&empty_tx);
+        let read_back = Block::from_bytes(&slot).expect("parses");
+        assert_eq!(read_back.content_length(), Some(HEADER_SIZE + 2));
+
+        let empty_balance = BlockBuilder::new()
+            .header(BlockHeader {
+                payload_type: PAYLOAD_TYPE_BALANCE,
+                ..sample_header()
+            })
+            .build_signed(&test_crypto())
+            .unwrap();
+        let slot = padded_slot(&empty_balance);
+        let read_back = Block::from_bytes(&slot).expect("parses");
+        assert_eq!(
+            read_back.content_length(),
+            Some(HEADER_SIZE + BALANCE_HEADER_SIZE)
+        );
+    }
+
+    #[test]
+    fn content_length_refuses_a_count_that_over_runs_the_buffer() {
+        // A transaction payload declaring 600 transactions it does not carry:
+        // the walk runs out of buffer and refuses rather than guessing.
+        let mut bytes = [0u8; MAX_BLOCK_SIZE];
+        bytes[VERSION_OFFSET] = 1;
+        bytes[PAYLOAD_TYPE_OFFSET] = PAYLOAD_TYPE_TRANSACTION;
+        bytes[PAYLOAD_OFFSET] = 0x58; // 600 little-endian
+        bytes[PAYLOAD_OFFSET + 1] = 0x02;
+        bytes[PAYLOAD_OFFSET + 2] = 1; // a node-transfer discriminant, then nothing
+        let view = BlockView::from_bytes(&bytes).expect("parses");
+        assert_eq!(view.content_length(), None);
+    }
+
+    #[test]
+    fn content_length_refuses_an_unknown_payload_type() {
+        let mut bytes = [0u8; MAX_BLOCK_SIZE];
+        bytes[VERSION_OFFSET] = 1;
+        bytes[PAYLOAD_TYPE_OFFSET] = 9;
+        let view = BlockView::from_bytes(&bytes).expect("parses");
+        assert_eq!(view.content_length(), None);
+    }
+
+    /// The approval payload has no wire format yet (Epic 6, FR12/FR27). The
+    /// empty shape — the only one constructible today — is answered; anything
+    /// else refuses, so a future non-empty approval payload breaks loudly here
+    /// instead of silently truncating to a header and hashing the wrong bytes.
+    #[test]
+    fn content_length_answers_an_empty_approval_and_refuses_a_populated_one() {
+        let mut bytes = [0u8; MAX_BLOCK_SIZE];
+        bytes[VERSION_OFFSET] = 1;
+        bytes[PAYLOAD_TYPE_OFFSET] = PAYLOAD_TYPE_APPROVAL;
+        let view = BlockView::from_bytes(&bytes).expect("parses");
+        assert_eq!(view.content_length(), Some(HEADER_SIZE));
+
+        bytes[PAYLOAD_OFFSET] = 1;
+        let view = BlockView::from_bytes(&bytes).expect("parses");
+        assert_eq!(
+            view.content_length(),
+            None,
+            "Epic 6 must extend the approval arm before such a block can restart"
+        );
+    }
+
+    /// For a block parsed from its exact wire bytes the two lengths agree; the
+    /// whole point is that they stop agreeing once storage pads it.
+    #[test]
+    fn content_length_equals_len_for_exact_wire_bytes() {
+        let block = transaction_block_with_signature(&[0xAA; 64]);
+        let parsed = Block::from_bytes(block.serialized_bytes()).expect("parses");
+        assert_eq!(parsed.content_length(), Some(parsed.len()));
     }
 
     #[test]

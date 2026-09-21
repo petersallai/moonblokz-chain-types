@@ -803,6 +803,32 @@ impl ComplexTransaction {
 // Helpers
 // =======================================================================
 
+/// Structural byte length of a transaction-block payload's content — the
+/// declared count walked transaction by transaction, with no reliance on where
+/// the caller's slice happens to end.
+///
+/// Exists so a block read back from durable storage — which arrives zero-padded
+/// to a fixed slot with no recorded length — can recover the exact byte sequence
+/// that was originally signed (FR59). Returns `None` on any incoherence: a
+/// declared count that over-runs the buffer, or an unknown transaction
+/// discriminant. It never guesses, and it is deliberately **not** a
+/// trailing-zero scan: a payload's last real byte may legitimately be zero.
+pub(crate) fn payload_content_len(payload: &[u8]) -> Option<usize> {
+    // The 2-byte transaction count, matching `TransactionBlockPayloadView`.
+    if payload.len() < 2 {
+        return None;
+    }
+    let count = u16::from_le_bytes([payload[0], payload[1]]);
+    let mut offset = 2usize;
+    for _ in 0..count {
+        // `transaction_size` bounds-checks against the slice it is handed, so
+        // the running offset can never pass the end of the payload here.
+        let size = transaction_size(payload.get(offset..)?)?;
+        offset += size;
+    }
+    Some(offset)
+}
+
 /// Calculates the total byte size of a transaction starting at data[0].
 fn transaction_size(data: &[u8]) -> Option<usize> {
     if data.len() < TX_HEADER_SIZE {
