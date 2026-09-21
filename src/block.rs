@@ -1114,6 +1114,36 @@ mod tests {
         assert_eq!(view.content_length(), None);
     }
 
+    /// AC1 names an unknown transaction/input/output discriminant as a refusal
+    /// case in its own right: the payload frames correctly as far as the count,
+    /// and only the item's type byte is unrecognised.
+    #[test]
+    fn content_length_refuses_an_unknown_transaction_discriminant() {
+        let mut bytes = [0u8; MAX_BLOCK_SIZE];
+        bytes[VERSION_OFFSET] = 1;
+        bytes[PAYLOAD_TYPE_OFFSET] = PAYLOAD_TYPE_TRANSACTION;
+        bytes[PAYLOAD_OFFSET] = 1; // one transaction declared, and it is present
+        bytes[PAYLOAD_OFFSET + 2] = 9; // ...but 9 is not a transaction type
+        let view = BlockView::from_bytes(&bytes).expect("parses");
+        assert_eq!(view.content_length(), None);
+    }
+
+    /// The same for a complex transaction's input discriminant, which is walked
+    /// by a different arm.
+    #[test]
+    fn content_length_refuses_an_unknown_complex_input_discriminant() {
+        let mut bytes = [0u8; MAX_BLOCK_SIZE];
+        bytes[VERSION_OFFSET] = 1;
+        bytes[PAYLOAD_TYPE_OFFSET] = PAYLOAD_TYPE_TRANSACTION;
+        bytes[PAYLOAD_OFFSET] = 1; // one transaction
+        bytes[PAYLOAD_OFFSET + 2] = 3; // complex
+        bytes[PAYLOAD_OFFSET + 2 + 5] = 1; // one input
+        bytes[PAYLOAD_OFFSET + 2 + 6] = 0; // zero outputs
+        bytes[PAYLOAD_OFFSET + 2 + 7] = 7; // ...and 7 is not an input type
+        let view = BlockView::from_bytes(&bytes).expect("parses");
+        assert_eq!(view.content_length(), None);
+    }
+
     #[test]
     fn content_length_refuses_an_unknown_payload_type() {
         let mut bytes = [0u8; MAX_BLOCK_SIZE];
