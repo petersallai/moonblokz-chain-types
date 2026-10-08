@@ -17,6 +17,27 @@ pub(crate) const BALANCE_HEADER_SIZE: usize = 6;
 // View types
 // =======================================================================
 
+/// Structural byte length of a balance-block payload's content — fixed-stride
+/// arithmetic over the declared entry count, with no reliance on where the
+/// caller's slice happens to end.
+///
+/// Exists so a block read back from durable storage — which arrives zero-padded
+/// to a fixed slot with no recorded length — can recover the exact byte sequence
+/// that was originally signed (FR59). Returns `None` when the declared count
+/// over-runs the buffer. Deliberately **not** a trailing-zero scan: a balance
+/// entry's last real byte may legitimately be zero.
+pub(crate) fn payload_content_len(payload: &[u8]) -> Option<usize> {
+    if payload.len() < BALANCE_HEADER_SIZE {
+        return None;
+    }
+    let count = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+    let len = BALANCE_HEADER_SIZE.checked_add(count.checked_mul(NODE_INFO_SIZE)?)?;
+    if len > payload.len() {
+        return None;
+    }
+    Some(len)
+}
+
 /// Zero-copy view over a balance block payload.
 pub struct BalanceBlockPayloadView<'a> {
     data: &'a [u8],
