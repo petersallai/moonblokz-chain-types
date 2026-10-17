@@ -36,7 +36,8 @@ pub const REGISTRATION_SIZE: usize = TX_HEADER_SIZE + REGISTRATION_BODY_SIZE;
 const UTXO_INPUT_BLOCK_SEQUENCE_OFFSET: usize = 0;
 const UTXO_INPUT_OUTPUT_INDEX_OFFSET: usize = UTXO_INPUT_BLOCK_SEQUENCE_OFFSET + 4;
 const UTXO_INPUT_SIGNATURE_OFFSET: usize = UTXO_INPUT_OUTPUT_INDEX_OFFSET + 1;
-const UTXO_INPUT_BODY_SIZE: usize = UTXO_INPUT_SIGNATURE_OFFSET + moonblokz_crypto::SIGNATURE_SIZE;
+const UTXO_INPUT_SIGNATURE_SIZE: usize = 64;
+const UTXO_INPUT_BODY_SIZE: usize = UTXO_INPUT_SIGNATURE_OFFSET + UTXO_INPUT_SIGNATURE_SIZE;
 
 // Input sizes (including type byte).
 const UTXO_INPUT_SIZE: usize = 1 + UTXO_INPUT_BODY_SIZE;
@@ -694,7 +695,7 @@ impl ComplexTransaction {
         &mut self,
         block_sequence: u32,
         output_index: u8,
-        signature: &[u8; 64],
+        signature: &[u8; UTXO_INPUT_SIGNATURE_SIZE],
     ) -> Result<&mut Self, BlockError> {
         if self.outputs_started {
             return Err(BlockError::MalformedBlock(
