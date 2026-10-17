@@ -32,8 +32,14 @@ pub const NODE_TRANSFER_SIZE: usize = TX_HEADER_SIZE + NODE_TRANSFER_BODY_SIZE;
 /// Total encoded size of a registration transaction (header + body).
 pub const REGISTRATION_SIZE: usize = TX_HEADER_SIZE + REGISTRATION_BODY_SIZE;
 
+// UTXO input body layout (ADR-016): block_sequence u32 LE ‖ output_index u8 ‖ signature.
+const UTXO_INPUT_BLOCK_SEQUENCE_OFFSET: usize = 0;
+const UTXO_INPUT_OUTPUT_INDEX_OFFSET: usize = UTXO_INPUT_BLOCK_SEQUENCE_OFFSET + 4;
+const UTXO_INPUT_SIGNATURE_OFFSET: usize = UTXO_INPUT_OUTPUT_INDEX_OFFSET + 1;
+const UTXO_INPUT_BODY_SIZE: usize = UTXO_INPUT_SIGNATURE_OFFSET + moonblokz_crypto::SIGNATURE_SIZE;
+
 // Input sizes (including type byte).
-const UTXO_INPUT_SIZE: usize = 98;
+const UTXO_INPUT_SIZE: usize = 1 + UTXO_INPUT_BODY_SIZE;
 const BALANCE_INPUT_SIZE: usize = 89;
 
 // Output sizes (including type byte).
@@ -431,20 +437,23 @@ impl<'a> Iterator for OutputIterator<'a> {
     }
 }
 
-/// Zero-copy view of a UTXO input body (97 bytes, excluding type byte).
+/// Zero-copy view of a UTXO input body (69 bytes, excluding type byte).
+///
+/// The input references the spent output by the sequence of the block that
+/// holds it and its position in that block's UTXO-output stream (ADR-016).
 pub struct UtxoInputView<'a> {
     data: &'a [u8],
 }
 
 impl<'a> UtxoInputView<'a> {
-    pub fn tr_hash(&self) -> &[u8] {
-        &self.data[0..32]
+    pub fn block_sequence(&self) -> u32 {
+        read_u32_le(self.data, UTXO_INPUT_BLOCK_SEQUENCE_OFFSET)
     }
     pub fn output_index(&self) -> u8 {
-        self.data[32]
+        self.data[UTXO_INPUT_OUTPUT_INDEX_OFFSET]
     }
     pub fn signature(&self) -> &[u8] {
-        &self.data[33..97]
+        &self.data[UTXO_INPUT_SIGNATURE_OFFSET..UTXO_INPUT_BODY_SIZE]
     }
 }
 
@@ -683,7 +692,7 @@ impl ComplexTransaction {
     /// Adds a UTXO input. Must be called before any output is added.
     pub fn add_utxo_input(
         &mut self,
-        tr_hash: &[u8; 32],
+        block_sequence: u32,
         output_index: u8,
         signature: &[u8; 64],
     ) -> Result<&mut Self, BlockError> {
@@ -699,11 +708,13 @@ impl ComplexTransaction {
                 actual: new_len,
             });
         }
-        let p = self.len;
-        self.data[p] = INPUT_TYPE_UTXO;
-        self.data[p + 1..p + 33].copy_from_slice(tr_hash);
-        self.data[p + 33] = output_index;
-        self.data[p + 34..p + 98].copy_from_slice(signature);
+        let body = self.len + 1;
+        self.data[self.len] = INPUT_TYPE_UTXO;
+        self.data[body + UTXO_INPUT_BLOCK_SEQUENCE_OFFSET..body + UTXO_INPUT_OUTPUT_INDEX_OFFSET]
+            .copy_from_slice(&block_sequence.to_le_bytes());
+        self.data[body + UTXO_INPUT_OUTPUT_INDEX_OFFSET] = output_index;
+        self.data[body + UTXO_INPUT_SIGNATURE_OFFSET..body + UTXO_INPUT_BODY_SIZE]
+            .copy_from_slice(signature);
         self.len = new_len;
         self.data[5] += 1;
         Ok(self)
@@ -1072,18 +1083,18 @@ mod tests {
 
     #[test]
     fn complex_view_utxo_round_trip() {
-        let mut tx_bytes = [0u8; 146];
+        let mut tx_bytes = [0u8; 118];
         tx_bytes[0] = TX_TYPE_COMPLEX;
         tx_bytes[1..5].copy_from_slice(&77u32.to_le_bytes());
         tx_bytes[5] = 1;
         tx_bytes[6] = 1;
         tx_bytes[7] = INPUT_TYPE_UTXO;
-        tx_bytes[8..40].fill(0xAB);
-        tx_bytes[40] = 3;
-        tx_bytes[41..105].fill(0xCD);
-        tx_bytes[105] = OUTPUT_TYPE_UTXO;
-        tx_bytes[106..138].fill(0xEF);
-        tx_bytes[138..146].copy_from_slice(&5000u64.to_le_bytes());
+        tx_bytes[8..12].copy_from_slice(&0x0102_0304u32.to_le_bytes());
+        tx_bytes[12] = 3;
+        tx_bytes[13..77].fill(0xCD);
+        tx_bytes[77] = OUTPUT_TYPE_UTXO;
+        tx_bytes[78..110].fill(0xEF);
+        tx_bytes[110..118].copy_from_slice(&5000u64.to_le_bytes());
 
         let block = build_tx_block(&[&tx_bytes[..]]);
         let tx = block.transactions().unwrap().iter().next().unwrap();
@@ -1096,9 +1107,9 @@ mod tests {
         let inp = cx.inputs().next().unwrap();
         assert_eq!(inp.input_type(), 0);
         let utxo_in = inp.as_utxo().unwrap();
-        assert_eq!(utxo_in.tr_hash(), &[0xAB; 32]);
+        assert_eq!(utxo_in.block_sequence(), 0x0102_0304);
         assert_eq!(utxo_in.output_index(), 3);
-        assert_eq!(utxo_in.signature().len(), 64);
+        assert_eq!(utxo_in.signature(), &[0xCD; 64]);
 
         let out = cx.outputs().next().unwrap();
         assert_eq!(out.output_type(), 0);
@@ -1198,10 +1209,9 @@ mod tests {
     #[test]
     fn complex_builder_utxo_round_trip() {
         let mut cx = ComplexTransaction::new(77);
-        let tr_hash = [0xAB; 32];
         let in_sig = [0xCD; 64];
         let address = [0xEF; 32];
-        cx.add_utxo_input(&tr_hash, 3, &in_sig).unwrap();
+        cx.add_utxo_input(41, 3, &in_sig).unwrap();
         cx.add_utxo_output(&address, 5000).unwrap();
 
         let bytes = cx.as_bytes();
@@ -1215,8 +1225,9 @@ mod tests {
 
         let inp = cv.inputs().next().unwrap();
         let ui = inp.as_utxo().unwrap();
-        assert_eq!(ui.tr_hash(), &[0xAB; 32]);
+        assert_eq!(ui.block_sequence(), 41);
         assert_eq!(ui.output_index(), 3);
+        assert_eq!(ui.signature(), &[0xCD; 64]);
 
         let out = cv.outputs().next().unwrap();
         let uo = out.as_utxo().unwrap();
@@ -1252,10 +1263,26 @@ mod tests {
         let address = [0; 32];
         cx.add_utxo_output(&address, 100).unwrap();
 
-        let tr_hash = [0; 32];
         let sig = [0; 64];
-        let result = cx.add_utxo_input(&tr_hash, 0, &sig);
+        let result = cx.add_utxo_input(0, 0, &sig);
         assert!(matches!(result, Err(BlockError::MalformedBlock(_))));
+    }
+
+    /// ADR-016 wire format: the entry is `type ‖ block_sequence u32 LE ‖
+    /// output_index ‖ signature`, 70 bytes with the type byte.
+    #[test]
+    fn utxo_input_entry_is_70_bytes_with_le_block_sequence() {
+        let mut cx = ComplexTransaction::new(0);
+        let sig = [0x77; 64];
+        cx.add_utxo_input(0xA1B2_C3D4, 9, &sig).unwrap();
+
+        let bytes = cx.as_bytes();
+        let entry = &bytes[TX_HEADER_SIZE + 2..];
+        assert_eq!(entry.len(), 70);
+        assert_eq!(entry[0], INPUT_TYPE_UTXO);
+        assert_eq!(&entry[1..5], &[0xD4, 0xC3, 0xB2, 0xA1]);
+        assert_eq!(entry[5], 9);
+        assert_eq!(&entry[6..70], &sig);
     }
 
     // -- Coverage tests --
@@ -1265,7 +1292,7 @@ mod tests {
         let mut cx = ComplexTransaction::new(10);
         let utxo_sig = [0xCD; 64];
         let bal_sig = [0x11; 64];
-        cx.add_utxo_input(&[0xAB; 32], 0, &utxo_sig).unwrap();
+        cx.add_utxo_input(9, 0, &utxo_sig).unwrap();
         cx.add_balance_input(50, 3, 1000, 7, &bal_sig).unwrap();
         cx.add_utxo_output(&[0xEF; 32], 800).unwrap();
         cx.add_balance_output(5, 200).unwrap();
@@ -1279,7 +1306,7 @@ mod tests {
         let mut inputs = cv.inputs();
         let i1 = inputs.next().unwrap();
         assert_eq!(i1.input_type(), 0);
-        assert_eq!(i1.as_utxo().unwrap().tr_hash(), &[0xAB; 32]);
+        assert_eq!(i1.as_utxo().unwrap().block_sequence(), 9);
         let i2 = inputs.next().unwrap();
         assert_eq!(i2.input_type(), 1);
         assert_eq!(i2.as_balance().unwrap().initializer(), 3);
@@ -1300,8 +1327,8 @@ mod tests {
         let mut cx = ComplexTransaction::new(0);
         let sig1 = [0xAA; 64];
         let sig2 = [0xBB; 64];
-        cx.add_utxo_input(&[0x01; 32], 0, &sig1).unwrap();
-        cx.add_utxo_input(&[0x02; 32], 1, &sig2).unwrap();
+        cx.add_utxo_input(1, 0, &sig1).unwrap();
+        cx.add_utxo_input(2, 1, &sig2).unwrap();
         cx.add_balance_output(1, 500).unwrap();
         cx.add_balance_output(2, 300).unwrap();
         cx.add_utxo_output(&[0xCC; 32], 200).unwrap();
@@ -1314,10 +1341,12 @@ mod tests {
 
         let mut inputs = cv.inputs();
         assert_eq!(
-            inputs.next().unwrap().as_utxo().unwrap().tr_hash(),
-            &[0x01; 32]
+            inputs.next().unwrap().as_utxo().unwrap().block_sequence(),
+            1
         );
-        assert_eq!(inputs.next().unwrap().as_utxo().unwrap().output_index(), 1);
+        let second = inputs.next().unwrap().as_utxo().unwrap();
+        assert_eq!(second.block_sequence(), 2);
+        assert_eq!(second.output_index(), 1);
         assert!(inputs.next().is_none());
 
         let mut outputs = cv.outputs();

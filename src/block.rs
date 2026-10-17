@@ -1020,7 +1020,7 @@ mod tests {
     fn content_length_recovers_a_complex_transaction_with_mixed_item_types() {
         let sig = [0x5A; 64];
         let mut cx = ComplexTransaction::new(4);
-        cx.add_utxo_input(&[1u8; 32], 2, &sig).unwrap();
+        cx.add_utxo_input(1, 2, &sig).unwrap();
         cx.add_balance_input(7, 3, 900, 0, &sig).unwrap();
         cx.add_utxo_output(&[2u8; 32], 400).unwrap();
         cx.add_balance_output(5, 500).unwrap();
@@ -1032,9 +1032,9 @@ mod tests {
         builder.add_complex_transaction(&cx).unwrap();
         let block = builder.build_signed(&test_crypto()).unwrap();
 
-        // 5 (tx header) + 2 (counts) + 98 + 89 + 41 + 13 = 248, + the 2-byte
+        // 5 (tx header) + 2 (counts) + 70 + 89 + 41 + 13 = 220, + the 2-byte
         // payload transaction count, + the block header.
-        assert_eq!(block.len(), HEADER_SIZE + 2 + 248);
+        assert_eq!(block.len(), HEADER_SIZE + 2 + 220);
         assert_recovers(&block);
     }
 
