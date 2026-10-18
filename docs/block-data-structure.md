@@ -120,8 +120,9 @@ Followed by inputs and outputs. Each starts with a `type: u8` field.
 
 | Field | Type | Description |
 |---|---|---|
-| `tr_hash` | `[u8; 32]` | Hash identifying the complex transaction that contains the UTXO output to spend. Hashes are used instead of sequence numbers for stability across chain direction changes. |
-| `output_index` | `u8` | Index of the specific UTXO output within the referenced transaction. |
+| `block_sequence` | `u32` (LE) | Sequence of the block that holds the UTXO output to spend. It must be a strict ancestor of the consuming block (ADR-016). |
+| `output_index` | `u8` | Position of the output in that block's UTXO-output stream: UTXO outputs only, transaction by transaction in block order, output by output within each transaction. |
+| `amount` | `u64` (LE) | The referenced output's amount, declared by the spender (DEC-131). It must equal the output's amount; it makes the complex transaction's input sum and fee decidable from its bytes. |
 | `signature` | `[u8; 64]` | Signature of this input & all outputs, signed with the private key corresponding to the UTXO's public key. |
 
 **Balance Input (input type 1):**
