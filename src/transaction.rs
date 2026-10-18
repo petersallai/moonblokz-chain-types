@@ -32,10 +32,12 @@ pub const NODE_TRANSFER_SIZE: usize = TX_HEADER_SIZE + NODE_TRANSFER_BODY_SIZE;
 /// Total encoded size of a registration transaction (header + body).
 pub const REGISTRATION_SIZE: usize = TX_HEADER_SIZE + REGISTRATION_BODY_SIZE;
 
-// UTXO input body layout (ADR-016): block_sequence u32 LE ‖ output_index u8 ‖ signature.
+// UTXO input body layout (ADR-016, DEC-131):
+// block_sequence u32 LE ‖ output_index u8 ‖ amount u64 LE ‖ signature.
 const UTXO_INPUT_BLOCK_SEQUENCE_OFFSET: usize = 0;
 const UTXO_INPUT_OUTPUT_INDEX_OFFSET: usize = UTXO_INPUT_BLOCK_SEQUENCE_OFFSET + 4;
-const UTXO_INPUT_SIGNATURE_OFFSET: usize = UTXO_INPUT_OUTPUT_INDEX_OFFSET + 1;
+const UTXO_INPUT_AMOUNT_OFFSET: usize = UTXO_INPUT_OUTPUT_INDEX_OFFSET + 1;
+const UTXO_INPUT_SIGNATURE_OFFSET: usize = UTXO_INPUT_AMOUNT_OFFSET + 8;
 const UTXO_INPUT_SIGNATURE_SIZE: usize = 64;
 const UTXO_INPUT_BODY_SIZE: usize = UTXO_INPUT_SIGNATURE_OFFSET + UTXO_INPUT_SIGNATURE_SIZE;
 
@@ -438,10 +440,11 @@ impl<'a> Iterator for OutputIterator<'a> {
     }
 }
 
-/// Zero-copy view of a UTXO input body (69 bytes, excluding type byte).
+/// Zero-copy view of a UTXO input body (77 bytes, excluding type byte).
 ///
 /// The input references the spent output by the sequence of the block that
-/// holds it and its position in that block's UTXO-output stream (ADR-016).
+/// holds it and its position in that block's UTXO-output stream (ADR-016),
+/// and declares the output's amount (DEC-131).
 pub struct UtxoInputView<'a> {
     data: &'a [u8],
 }
@@ -452,6 +455,9 @@ impl<'a> UtxoInputView<'a> {
     }
     pub fn output_index(&self) -> u8 {
         self.data[UTXO_INPUT_OUTPUT_INDEX_OFFSET]
+    }
+    pub fn amount(&self) -> u64 {
+        read_u64_le(self.data, UTXO_INPUT_AMOUNT_OFFSET)
     }
     pub fn signature(&self) -> &[u8] {
         &self.data[UTXO_INPUT_SIGNATURE_OFFSET..UTXO_INPUT_BODY_SIZE]
@@ -695,6 +701,7 @@ impl ComplexTransaction {
         &mut self,
         block_sequence: u32,
         output_index: u8,
+        amount: u64,
         signature: &[u8; UTXO_INPUT_SIGNATURE_SIZE],
     ) -> Result<&mut Self, BlockError> {
         if self.outputs_started {
@@ -714,6 +721,8 @@ impl ComplexTransaction {
         self.data[body + UTXO_INPUT_BLOCK_SEQUENCE_OFFSET..body + UTXO_INPUT_OUTPUT_INDEX_OFFSET]
             .copy_from_slice(&block_sequence.to_le_bytes());
         self.data[body + UTXO_INPUT_OUTPUT_INDEX_OFFSET] = output_index;
+        self.data[body + UTXO_INPUT_AMOUNT_OFFSET..body + UTXO_INPUT_SIGNATURE_OFFSET]
+            .copy_from_slice(&amount.to_le_bytes());
         self.data[body + UTXO_INPUT_SIGNATURE_OFFSET..body + UTXO_INPUT_BODY_SIZE]
             .copy_from_slice(signature);
         self.len = new_len;
@@ -1084,7 +1093,7 @@ mod tests {
 
     #[test]
     fn complex_view_utxo_round_trip() {
-        let mut tx_bytes = [0u8; 118];
+        let mut tx_bytes = [0u8; 126];
         tx_bytes[0] = TX_TYPE_COMPLEX;
         tx_bytes[1..5].copy_from_slice(&77u32.to_le_bytes());
         tx_bytes[5] = 1;
@@ -1092,10 +1101,11 @@ mod tests {
         tx_bytes[7] = INPUT_TYPE_UTXO;
         tx_bytes[8..12].copy_from_slice(&0x0102_0304u32.to_le_bytes());
         tx_bytes[12] = 3;
-        tx_bytes[13..77].fill(0xCD);
-        tx_bytes[77] = OUTPUT_TYPE_UTXO;
-        tx_bytes[78..110].fill(0xEF);
-        tx_bytes[110..118].copy_from_slice(&5000u64.to_le_bytes());
+        tx_bytes[13..21].copy_from_slice(&5000u64.to_le_bytes());
+        tx_bytes[21..85].fill(0xCD);
+        tx_bytes[85] = OUTPUT_TYPE_UTXO;
+        tx_bytes[86..118].fill(0xEF);
+        tx_bytes[118..126].copy_from_slice(&5000u64.to_le_bytes());
 
         let block = build_tx_block(&[&tx_bytes[..]]);
         let tx = block.transactions().unwrap().iter().next().unwrap();
@@ -1110,6 +1120,7 @@ mod tests {
         let utxo_in = inp.as_utxo().unwrap();
         assert_eq!(utxo_in.block_sequence(), 0x0102_0304);
         assert_eq!(utxo_in.output_index(), 3);
+        assert_eq!(utxo_in.amount(), 5000);
         assert_eq!(utxo_in.signature(), &[0xCD; 64]);
 
         let out = cx.outputs().next().unwrap();
@@ -1212,7 +1223,7 @@ mod tests {
         let mut cx = ComplexTransaction::new(77);
         let in_sig = [0xCD; 64];
         let address = [0xEF; 32];
-        cx.add_utxo_input(41, 3, &in_sig).unwrap();
+        cx.add_utxo_input(41, 3, 5000, &in_sig).unwrap();
         cx.add_utxo_output(&address, 5000).unwrap();
 
         let bytes = cx.as_bytes();
@@ -1228,6 +1239,7 @@ mod tests {
         let ui = inp.as_utxo().unwrap();
         assert_eq!(ui.block_sequence(), 41);
         assert_eq!(ui.output_index(), 3);
+        assert_eq!(ui.amount(), 5000);
         assert_eq!(ui.signature(), &[0xCD; 64]);
 
         let out = cv.outputs().next().unwrap();
@@ -1265,25 +1277,28 @@ mod tests {
         cx.add_utxo_output(&address, 100).unwrap();
 
         let sig = [0; 64];
-        let result = cx.add_utxo_input(0, 0, &sig);
+        let result = cx.add_utxo_input(0, 0, 0, &sig);
         assert!(matches!(result, Err(BlockError::MalformedBlock(_))));
     }
 
-    /// ADR-016 wire format: the entry is `type ‖ block_sequence u32 LE ‖
-    /// output_index ‖ signature`, 70 bytes with the type byte.
+    /// ADR-016 / DEC-131 wire format: the entry is `type ‖ block_sequence
+    /// u32 LE ‖ output_index ‖ amount u64 LE ‖ signature`, 78 bytes with the
+    /// type byte.
     #[test]
-    fn utxo_input_entry_is_70_bytes_with_le_block_sequence() {
+    fn utxo_input_entry_is_78_bytes_with_le_sequence_and_amount() {
         let mut cx = ComplexTransaction::new(0);
         let sig = [0x77; 64];
-        cx.add_utxo_input(0xA1B2_C3D4, 9, &sig).unwrap();
+        cx.add_utxo_input(0xA1B2_C3D4, 9, 0x0102_0304_0506_0708, &sig)
+            .unwrap();
 
         let bytes = cx.as_bytes();
         let entry = &bytes[TX_HEADER_SIZE + 2..];
-        assert_eq!(entry.len(), 70);
+        assert_eq!(entry.len(), 78);
         assert_eq!(entry[0], INPUT_TYPE_UTXO);
         assert_eq!(&entry[1..5], &[0xD4, 0xC3, 0xB2, 0xA1]);
         assert_eq!(entry[5], 9);
-        assert_eq!(&entry[6..70], &sig);
+        assert_eq!(&entry[6..14], &[8, 7, 6, 5, 4, 3, 2, 1]);
+        assert_eq!(&entry[14..78], &sig);
     }
 
     // -- Coverage tests --
@@ -1293,7 +1308,7 @@ mod tests {
         let mut cx = ComplexTransaction::new(10);
         let utxo_sig = [0xCD; 64];
         let bal_sig = [0x11; 64];
-        cx.add_utxo_input(9, 0, &utxo_sig).unwrap();
+        cx.add_utxo_input(9, 0, 800, &utxo_sig).unwrap();
         cx.add_balance_input(50, 3, 1000, 7, &bal_sig).unwrap();
         cx.add_utxo_output(&[0xEF; 32], 800).unwrap();
         cx.add_balance_output(5, 200).unwrap();
@@ -1328,8 +1343,8 @@ mod tests {
         let mut cx = ComplexTransaction::new(0);
         let sig1 = [0xAA; 64];
         let sig2 = [0xBB; 64];
-        cx.add_utxo_input(1, 0, &sig1).unwrap();
-        cx.add_utxo_input(2, 1, &sig2).unwrap();
+        cx.add_utxo_input(1, 0, 600, &sig1).unwrap();
+        cx.add_utxo_input(2, 1, 400, &sig2).unwrap();
         cx.add_balance_output(1, 500).unwrap();
         cx.add_balance_output(2, 300).unwrap();
         cx.add_utxo_output(&[0xCC; 32], 200).unwrap();
