@@ -10,8 +10,14 @@ use crate::block::{read_u32_le, read_u64_le};
 /// Size of a single balance entry (node info) in bytes.
 pub const NODE_INFO_SIZE: usize = 48;
 
-/// Size of the balance payload header: nodeinfo_count(2) + max_node_id(4).
-pub(crate) const BALANCE_HEADER_SIZE: usize = 6;
+/// Size of the balance payload header: nodeinfo_count(4) + max_node_id(4).
+///
+/// The count is a `u32` (DEC-222): a balance replay must not be split by a count
+/// limit, and at large block-size tiers a block holds more than 65 535 entries.
+pub(crate) const BALANCE_HEADER_SIZE: usize = 8;
+
+/// Offset of `max_node_id` in the balance payload header, after the count.
+pub(crate) const BALANCE_MAX_NODE_ID_OFFSET: usize = 4;
 
 // =======================================================================
 // View types
@@ -30,7 +36,7 @@ pub(crate) fn payload_content_len(payload: &[u8]) -> Option<usize> {
     if payload.len() < BALANCE_HEADER_SIZE {
         return None;
     }
-    let count = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+    let count = read_u32_le(payload, 0) as usize;
     let len = BALANCE_HEADER_SIZE.checked_add(count.checked_mul(NODE_INFO_SIZE)?)?;
     if len > payload.len() {
         return None;
@@ -52,13 +58,13 @@ impl<'a> BalanceBlockPayloadView<'a> {
     }
 
     /// Number of node-info entries.
-    pub fn count(&self) -> u16 {
-        u16::from_le_bytes([self.data[0], self.data[1]])
+    pub fn count(&self) -> u32 {
+        read_u32_le(self.data, 0)
     }
 
     /// Highest node id known to the network at block creation time.
     pub fn max_node_id(&self) -> u32 {
-        read_u32_le(self.data, 2)
+        read_u32_le(self.data, BALANCE_MAX_NODE_ID_OFFSET)
     }
 
     /// Returns an iterator over the node-info entries.
@@ -75,7 +81,7 @@ impl<'a> BalanceBlockPayloadView<'a> {
 pub struct BalanceIterator<'a> {
     data: &'a [u8],
     offset: usize,
-    remaining: u16,
+    remaining: u32,
 }
 
 impl<'a> Iterator for BalanceIterator<'a> {

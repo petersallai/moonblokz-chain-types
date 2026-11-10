@@ -33,10 +33,12 @@ pub const NODE_TRANSFER_SIZE: usize = TX_HEADER_SIZE + NODE_TRANSFER_BODY_SIZE;
 pub const REGISTRATION_SIZE: usize = TX_HEADER_SIZE + REGISTRATION_BODY_SIZE;
 
 // UTXO input body layout (ADR-016, DEC-131):
-// block_sequence u32 LE ‖ output_index u8 ‖ amount u64 LE ‖ signature.
+// block_sequence u32 LE ‖ output_index u16 LE ‖ amount u64 LE ‖ signature.
+// `output_index` is a `u16` (DEC-222): it indexes the referenced block's whole
+// UTXO-output stream, whose size is chain parameter ID 4 (`u16`).
 const UTXO_INPUT_BLOCK_SEQUENCE_OFFSET: usize = 0;
 const UTXO_INPUT_OUTPUT_INDEX_OFFSET: usize = UTXO_INPUT_BLOCK_SEQUENCE_OFFSET + 4;
-const UTXO_INPUT_AMOUNT_OFFSET: usize = UTXO_INPUT_OUTPUT_INDEX_OFFSET + 1;
+const UTXO_INPUT_AMOUNT_OFFSET: usize = UTXO_INPUT_OUTPUT_INDEX_OFFSET + 2;
 const UTXO_INPUT_SIGNATURE_OFFSET: usize = UTXO_INPUT_AMOUNT_OFFSET + 8;
 const UTXO_INPUT_SIGNATURE_SIZE: usize = 64;
 const UTXO_INPUT_BODY_SIZE: usize = UTXO_INPUT_SIGNATURE_OFFSET + UTXO_INPUT_SIGNATURE_SIZE;
@@ -440,7 +442,7 @@ impl<'a> Iterator for OutputIterator<'a> {
     }
 }
 
-/// Zero-copy view of a UTXO input body (77 bytes, excluding type byte).
+/// Zero-copy view of a UTXO input body (78 bytes, excluding type byte).
 ///
 /// The input references the spent output by the sequence of the block that
 /// holds it and its position in that block's UTXO-output stream (ADR-016),
@@ -453,8 +455,11 @@ impl<'a> UtxoInputView<'a> {
     pub fn block_sequence(&self) -> u32 {
         read_u32_le(self.data, UTXO_INPUT_BLOCK_SEQUENCE_OFFSET)
     }
-    pub fn output_index(&self) -> u8 {
-        self.data[UTXO_INPUT_OUTPUT_INDEX_OFFSET]
+    pub fn output_index(&self) -> u16 {
+        u16::from_le_bytes([
+            self.data[UTXO_INPUT_OUTPUT_INDEX_OFFSET],
+            self.data[UTXO_INPUT_OUTPUT_INDEX_OFFSET + 1],
+        ])
     }
     pub fn amount(&self) -> u64 {
         read_u64_le(self.data, UTXO_INPUT_AMOUNT_OFFSET)
@@ -672,11 +677,33 @@ impl Registration {
     }
 }
 
+/// The largest encoded transaction this build can hold (DEC-223).
+///
+/// A transaction is bounded by the protocol, not by the block: its input and
+/// output counts are `u8`, so the largest is a complex transaction with 255
+/// balance inputs and 255 UTXO outputs. A block's payload, less its 2-byte
+/// transaction count, bounds it further on small tiers. Sizes the
+/// [`ComplexTransaction`] builder; not a validity rule.
+pub const MAX_TRANSACTION_SIZE: usize = {
+    let protocol = TX_HEADER_SIZE + 2 + 255 * BALANCE_INPUT_SIZE + 255 * UTXO_OUTPUT_SIZE;
+    let payload = MAX_PAYLOAD_SIZE - 2;
+    if protocol < payload {
+        protocol
+    } else {
+        payload
+    }
+};
+// The formula above uses the largest input and output kinds.
+const _: () = assert!(BALANCE_INPUT_SIZE >= UTXO_INPUT_SIZE);
+const _: () = assert!(UTXO_OUTPUT_SIZE >= BALANCE_OUTPUT_SIZE);
+const _: () = assert!(NODE_TRANSFER_SIZE <= MAX_TRANSACTION_SIZE);
+const _: () = assert!(REGISTRATION_SIZE <= MAX_TRANSACTION_SIZE);
+
 /// Owned complex transaction builder for block construction.
 ///
 /// Inputs must be added before outputs.
 pub struct ComplexTransaction {
-    data: [u8; MAX_PAYLOAD_SIZE],
+    data: [u8; MAX_TRANSACTION_SIZE],
     len: usize,
     outputs_started: bool,
 }
@@ -684,7 +711,7 @@ pub struct ComplexTransaction {
 impl ComplexTransaction {
     /// Creates an empty complex transaction with the given vote target.
     pub fn new(vote: u32) -> Self {
-        let mut data = [0u8; MAX_PAYLOAD_SIZE];
+        let mut data = [0u8; MAX_TRANSACTION_SIZE];
         data[0] = TX_TYPE_COMPLEX;
         data[1..5].copy_from_slice(&vote.to_le_bytes());
         data[5] = 0; // input_count
@@ -700,7 +727,7 @@ impl ComplexTransaction {
     pub fn add_utxo_input(
         &mut self,
         block_sequence: u32,
-        output_index: u8,
+        output_index: u16,
         amount: u64,
         signature: &[u8; UTXO_INPUT_SIGNATURE_SIZE],
     ) -> Result<&mut Self, BlockError> {
@@ -709,10 +736,11 @@ impl ComplexTransaction {
                 "cannot add inputs after outputs",
             ));
         }
+        let input_count = self.next_input_count()?;
         let new_len = self.len + UTXO_INPUT_SIZE;
-        if new_len > MAX_PAYLOAD_SIZE {
+        if new_len > MAX_TRANSACTION_SIZE {
             return Err(BlockError::PayloadTooLarge {
-                max: MAX_PAYLOAD_SIZE,
+                max: MAX_TRANSACTION_SIZE,
                 actual: new_len,
             });
         }
@@ -720,13 +748,14 @@ impl ComplexTransaction {
         self.data[self.len] = INPUT_TYPE_UTXO;
         self.data[body + UTXO_INPUT_BLOCK_SEQUENCE_OFFSET..body + UTXO_INPUT_OUTPUT_INDEX_OFFSET]
             .copy_from_slice(&block_sequence.to_le_bytes());
-        self.data[body + UTXO_INPUT_OUTPUT_INDEX_OFFSET] = output_index;
+        self.data[body + UTXO_INPUT_OUTPUT_INDEX_OFFSET..body + UTXO_INPUT_AMOUNT_OFFSET]
+            .copy_from_slice(&output_index.to_le_bytes());
         self.data[body + UTXO_INPUT_AMOUNT_OFFSET..body + UTXO_INPUT_SIGNATURE_OFFSET]
             .copy_from_slice(&amount.to_le_bytes());
         self.data[body + UTXO_INPUT_SIGNATURE_OFFSET..body + UTXO_INPUT_BODY_SIZE]
             .copy_from_slice(signature);
+        self.data[5] = input_count;
         self.len = new_len;
-        self.data[5] += 1;
         Ok(self)
     }
 
@@ -744,10 +773,11 @@ impl ComplexTransaction {
                 "cannot add inputs after outputs",
             ));
         }
+        let input_count = self.next_input_count()?;
         let new_len = self.len + BALANCE_INPUT_SIZE;
-        if new_len > MAX_PAYLOAD_SIZE {
+        if new_len > MAX_TRANSACTION_SIZE {
             return Err(BlockError::PayloadTooLarge {
-                max: MAX_PAYLOAD_SIZE,
+                max: MAX_TRANSACTION_SIZE,
                 actual: new_len,
             });
         }
@@ -758,8 +788,8 @@ impl ComplexTransaction {
         self.data[p + 9..p + 17].copy_from_slice(&amount.to_le_bytes());
         self.data[p + 17..p + 25].copy_from_slice(&comment.to_le_bytes());
         self.data[p + 25..p + 89].copy_from_slice(signature);
+        self.data[5] = input_count;
         self.len = new_len;
-        self.data[5] += 1;
         Ok(self)
     }
 
@@ -769,10 +799,11 @@ impl ComplexTransaction {
         address: &[u8; 32],
         amount: u64,
     ) -> Result<&mut Self, BlockError> {
+        let output_count = self.next_output_count()?;
         let new_len = self.len + UTXO_OUTPUT_SIZE;
-        if new_len > MAX_PAYLOAD_SIZE {
+        if new_len > MAX_TRANSACTION_SIZE {
             return Err(BlockError::PayloadTooLarge {
-                max: MAX_PAYLOAD_SIZE,
+                max: MAX_TRANSACTION_SIZE,
                 actual: new_len,
             });
         }
@@ -781,8 +812,8 @@ impl ComplexTransaction {
         self.data[p] = OUTPUT_TYPE_UTXO;
         self.data[p + 1..p + 33].copy_from_slice(address);
         self.data[p + 33..p + 41].copy_from_slice(&amount.to_le_bytes());
+        self.data[6] = output_count;
         self.len = new_len;
-        self.data[6] += 1;
         Ok(self)
     }
 
@@ -792,10 +823,11 @@ impl ComplexTransaction {
         receiver: u32,
         amount: u64,
     ) -> Result<&mut Self, BlockError> {
+        let output_count = self.next_output_count()?;
         let new_len = self.len + BALANCE_OUTPUT_SIZE;
-        if new_len > MAX_PAYLOAD_SIZE {
+        if new_len > MAX_TRANSACTION_SIZE {
             return Err(BlockError::PayloadTooLarge {
-                max: MAX_PAYLOAD_SIZE,
+                max: MAX_TRANSACTION_SIZE,
                 actual: new_len,
             });
         }
@@ -804,9 +836,24 @@ impl ComplexTransaction {
         self.data[p] = OUTPUT_TYPE_BALANCE;
         self.data[p + 1..p + 5].copy_from_slice(&receiver.to_le_bytes());
         self.data[p + 5..p + 13].copy_from_slice(&amount.to_le_bytes());
+        self.data[6] = output_count;
         self.len = new_len;
-        self.data[6] += 1;
         Ok(self)
+    }
+
+    /// The input count after one more input. A `u8` per transaction (a protocol
+    /// bound of 255), so the 256th input is refused rather than wrapped.
+    fn next_input_count(&self) -> Result<u8, BlockError> {
+        self.data[5]
+            .checked_add(1)
+            .ok_or(BlockError::MalformedBlock("too many inputs"))
+    }
+
+    /// The output count after one more output; the 256th is refused.
+    fn next_output_count(&self) -> Result<u8, BlockError> {
+        self.data[6]
+            .checked_add(1)
+            .ok_or(BlockError::MalformedBlock("too many outputs"))
     }
 
     /// Returns the serialized transaction bytes.
@@ -1093,19 +1140,19 @@ mod tests {
 
     #[test]
     fn complex_view_utxo_round_trip() {
-        let mut tx_bytes = [0u8; 126];
+        let mut tx_bytes = [0u8; 127];
         tx_bytes[0] = TX_TYPE_COMPLEX;
         tx_bytes[1..5].copy_from_slice(&77u32.to_le_bytes());
         tx_bytes[5] = 1;
         tx_bytes[6] = 1;
         tx_bytes[7] = INPUT_TYPE_UTXO;
         tx_bytes[8..12].copy_from_slice(&0x0102_0304u32.to_le_bytes());
-        tx_bytes[12] = 3;
-        tx_bytes[13..21].copy_from_slice(&5000u64.to_le_bytes());
-        tx_bytes[21..85].fill(0xCD);
-        tx_bytes[85] = OUTPUT_TYPE_UTXO;
-        tx_bytes[86..118].fill(0xEF);
-        tx_bytes[118..126].copy_from_slice(&5000u64.to_le_bytes());
+        tx_bytes[12..14].copy_from_slice(&3u16.to_le_bytes());
+        tx_bytes[14..22].copy_from_slice(&5000u64.to_le_bytes());
+        tx_bytes[22..86].fill(0xCD);
+        tx_bytes[86] = OUTPUT_TYPE_UTXO;
+        tx_bytes[87..119].fill(0xEF);
+        tx_bytes[119..127].copy_from_slice(&5000u64.to_le_bytes());
 
         let block = build_tx_block(&[&tx_bytes[..]]);
         let tx = block.transactions().unwrap().iter().next().unwrap();
@@ -1281,24 +1328,52 @@ mod tests {
         assert!(matches!(result, Err(BlockError::MalformedBlock(_))));
     }
 
-    /// ADR-016 / DEC-131 wire format: the entry is `type ‖ block_sequence
-    /// u32 LE ‖ output_index ‖ amount u64 LE ‖ signature`, 78 bytes with the
-    /// type byte.
+    /// ADR-016 / DEC-131 / DEC-222 wire format: the entry is `type ‖
+    /// block_sequence u32 LE ‖ output_index u16 LE ‖ amount u64 LE ‖
+    /// signature`, 79 bytes with the type byte.
     #[test]
-    fn utxo_input_entry_is_78_bytes_with_le_sequence_and_amount() {
+    fn utxo_input_entry_is_79_bytes_with_le_sequence_index_and_amount() {
         let mut cx = ComplexTransaction::new(0);
         let sig = [0x77; 64];
-        cx.add_utxo_input(0xA1B2_C3D4, 9, 0x0102_0304_0506_0708, &sig)
+        cx.add_utxo_input(0xA1B2_C3D4, 0x0309, 0x0102_0304_0506_0708, &sig)
             .unwrap();
 
         let bytes = cx.as_bytes();
         let entry = &bytes[TX_HEADER_SIZE + 2..];
-        assert_eq!(entry.len(), 78);
+        assert_eq!(entry.len(), 79);
         assert_eq!(entry[0], INPUT_TYPE_UTXO);
         assert_eq!(&entry[1..5], &[0xD4, 0xC3, 0xB2, 0xA1]);
-        assert_eq!(entry[5], 9);
-        assert_eq!(&entry[6..14], &[8, 7, 6, 5, 4, 3, 2, 1]);
-        assert_eq!(&entry[14..78], &sig);
+        assert_eq!(&entry[5..7], &[0x09, 0x03]);
+        assert_eq!(&entry[7..15], &[8, 7, 6, 5, 4, 3, 2, 1]);
+        assert_eq!(&entry[15..79], &sig);
+
+        // An index above `u8` round-trips; the bitfield refuses it later.
+        let view = TransactionView { data: bytes };
+        let input = view.as_complex().unwrap().inputs().next().unwrap();
+        assert_eq!(input.as_utxo().unwrap().output_index(), 0x0309);
+    }
+
+    /// Input and output counts are `u8` per transaction: the 256th is refused,
+    /// never wrapped to 0.
+    #[test]
+    fn the_256th_input_and_output_are_refused() {
+        let mut cx = ComplexTransaction::new(0);
+        cx.data[5] = u8::MAX;
+        let input = cx.add_balance_input(1, 1, 1, 0, &[0; 64]);
+        assert!(matches!(
+            input,
+            Err(BlockError::MalformedBlock("too many inputs"))
+        ));
+        assert_eq!(cx.data[5], u8::MAX);
+
+        let mut cx = ComplexTransaction::new(0);
+        cx.data[6] = u8::MAX;
+        let output = cx.add_balance_output(1, 1);
+        assert!(matches!(
+            output,
+            Err(BlockError::MalformedBlock("too many outputs"))
+        ));
+        assert_eq!(cx.data[6], u8::MAX);
     }
 
     // -- Coverage tests --

@@ -646,6 +646,10 @@ mod tests {
         assert!(builder.add_literal(1, &oversized).is_err());
     }
 
+    // On the reference tier the payload capacity refuses first. On larger tiers
+    // the 126 distinct identifiers run out before the capacity does (a protocol
+    // bound, DEC-222), so there is no capacity refusal to observe.
+    #[cfg(feature = "block-size-2016")]
     #[test]
     fn builder_reserves_room_for_the_signature() {
         let mut builder = ChainConfigPayloadBuilder::new();

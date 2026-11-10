@@ -66,7 +66,8 @@ pub use error::BlockError;
 pub use hash::{HASH_SIZE, calculate_hash};
 pub use transaction::{
     BalanceInputView, BalanceOutputView, ComplexTransaction, ComplexTransactionView, InputIterator,
-    InputView, NODE_TRANSFER_SIZE, NodeTransfer, NodeTransferView, OutputIterator, OutputView,
-    REGISTRATION_SIZE, Registration, RegistrationView, TransactionBlockPayloadView,
-    TransactionIterator, TransactionView, UtxoInputView, UtxoOutputView,
+    InputView, MAX_TRANSACTION_SIZE, NODE_TRANSFER_SIZE, NodeTransfer, NodeTransferView,
+    OutputIterator, OutputView, REGISTRATION_SIZE, Registration, RegistrationView,
+    TransactionBlockPayloadView, TransactionIterator, TransactionView, UtxoInputView,
+    UtxoOutputView,
 };

@@ -38,7 +38,8 @@ Release expectations for crates.io phase:
 - `ChainConfigBlockPayloadView`, `ChainConfigPayloadBuilder`: chain-config payload envelope — content region, node-#0 content signature, and entry framing. Parameter semantics belong to `moonblokz-configuration`.
 - `calculate_hash`: canonical SHA-256 helper for raw byte buffers used by lower-level storage and chain logic.
 - Constants:
-  - `MAX_BLOCK_SIZE`
+  - `MAX_BLOCK_SIZE` — the build's block capacity, selected by a block-size tier feature (`block-size-2016` default, `block-size-65536`); exactly one must be enabled
+  - `MAX_TRANSACTION_SIZE`
   - `HEADER_SIZE`
   - `MAX_PAYLOAD_SIZE`
   - `HASH_SIZE`
