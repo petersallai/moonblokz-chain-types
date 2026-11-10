@@ -24,6 +24,18 @@ compile_error!(
     "moonblokz-chain-types requires exactly one Schnorr backend feature; disable default features when selecting an alternate backend"
 );
 
+// Exactly one block-size tier: the build's block capacity (DEC-220). It is a
+// property of the whole binary, so every crate above forwards the same feature.
+#[cfg(not(any(feature = "block-size-2016", feature = "block-size-65536")))]
+compile_error!(
+    "moonblokz-chain-types requires exactly one block-size tier feature; keep the default `block-size-2016`, or choose another with `default-features = false`"
+);
+
+#[cfg(all(feature = "block-size-2016", feature = "block-size-65536"))]
+compile_error!(
+    "moonblokz-chain-types requires exactly one block-size tier feature; disable default features when selecting another tier"
+);
+
 pub mod balance;
 pub mod block;
 pub mod chain_config;

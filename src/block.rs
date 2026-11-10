@@ -33,8 +33,23 @@ use crate::transaction::{
 };
 use moonblokz_crypto::{CryptoTrait, SignatureTrait};
 
-/// Maximum encoded block size in bytes.
+/// This build's block capacity in bytes: the largest encoded block it can
+/// frame, hold and store.
+///
+/// A build parameter, selected by the block-size tier feature (DEC-220), not a
+/// protocol constant. The chain's own maximum is configuration ID 3
+/// `block_size_limit`; acceptance refuses a chain that declares more than this
+/// capacity, so a block above it is a local refusal, never evidence (DEC-225).
+#[cfg(feature = "block-size-2016")]
 pub const MAX_BLOCK_SIZE: usize = 2016;
+/// This build's block capacity in bytes (the `block-size-65536` tier, the first
+/// above `u16`; see the `block-size-2016` documentation).
+#[cfg(feature = "block-size-65536")]
+pub const MAX_BLOCK_SIZE: usize = 65536;
+
+// Every capacity and every block length the stack holds is a `u32` (DEC-224,
+// DEC-227), so a tier above it could not be stated.
+const _: () = assert!(MAX_BLOCK_SIZE <= u32::MAX as usize);
 
 /// Fixed header size in bytes for the current MoonBlokz block format.
 pub const HEADER_SIZE: usize = 122;
