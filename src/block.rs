@@ -1076,11 +1076,19 @@ mod tests {
             .add_transaction_bytes(&[3, 0, 0, 0, 0, 0, 0])
             .unwrap();
         builder.item_count = u32::from(u16::MAX);
+        let (len_before, count_before) = (
+            builder.payload_len,
+            [builder.payload[0], builder.payload[1]],
+        );
         let result = builder.add_transaction_bytes(&[3, 0, 0, 0, 0, 0, 0]);
         assert!(matches!(
             result,
             Err(BlockError::MalformedBlock("too many transactions"))
         ));
+        // Refused before anything is written.
+        assert_eq!(builder.payload_len, len_before);
+        assert_eq!([builder.payload[0], builder.payload[1]], count_before);
+        assert_eq!(builder.item_count, u32::from(u16::MAX));
     }
 
     #[test]

@@ -1364,7 +1364,17 @@ mod tests {
             input,
             Err(BlockError::MalformedBlock("too many inputs"))
         ));
+        let utxo = cx.add_utxo_input(1, 0, 1, &[0; 64]);
+        assert!(matches!(
+            utxo,
+            Err(BlockError::MalformedBlock("too many inputs"))
+        ));
         assert_eq!(cx.data[5], u8::MAX);
+        assert_eq!(
+            cx.as_bytes().len(),
+            TX_HEADER_SIZE + 2,
+            "nothing was written"
+        );
 
         let mut cx = ComplexTransaction::new(0);
         cx.data[6] = u8::MAX;
@@ -1373,7 +1383,17 @@ mod tests {
             output,
             Err(BlockError::MalformedBlock("too many outputs"))
         ));
+        let utxo = cx.add_utxo_output(&[0; 32], 1);
+        assert!(matches!(
+            utxo,
+            Err(BlockError::MalformedBlock("too many outputs"))
+        ));
         assert_eq!(cx.data[6], u8::MAX);
+        assert_eq!(
+            cx.as_bytes().len(),
+            TX_HEADER_SIZE + 2,
+            "nothing was written"
+        );
     }
 
     // -- Coverage tests --
