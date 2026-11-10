@@ -1072,7 +1072,9 @@ mod tests {
             payload_type: 0,
             ..sample_header()
         });
-        builder.add_transaction_bytes(&[3, 0, 0, 0, 0, 0, 0]).unwrap();
+        builder
+            .add_transaction_bytes(&[3, 0, 0, 0, 0, 0, 0])
+            .unwrap();
         builder.item_count = u32::from(u16::MAX);
         let result = builder.add_transaction_bytes(&[3, 0, 0, 0, 0, 0, 0]);
         assert!(matches!(
