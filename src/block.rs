@@ -24,7 +24,9 @@ machinery and extra code into the final binary. Derive them downstream
 via newtype wrappers if needed for diagnostics or testing.
 */
 
-use crate::balance::{BALANCE_HEADER_SIZE, BalanceBlockPayloadView, NodeInfo};
+use crate::balance::{
+    BALANCE_HEADER_SIZE, BALANCE_MAX_NODE_ID_OFFSET, BalanceBlockPayloadView, NodeInfo,
+};
 use crate::chain_config::ChainConfigBlockPayloadView;
 use crate::error::BlockError;
 use crate::hash::{HASH_SIZE, calculate_hash};
@@ -33,8 +35,23 @@ use crate::transaction::{
 };
 use moonblokz_crypto::{CryptoTrait, SignatureTrait};
 
-/// Maximum encoded block size in bytes.
+/// This build's block capacity in bytes: the largest encoded block it can
+/// frame, hold and store.
+///
+/// A build parameter, selected by the block-size tier feature (DEC-220), not a
+/// protocol constant. The chain's own maximum is configuration ID 3
+/// `block_size_limit`; acceptance refuses a chain that declares more than this
+/// capacity, so a block above it is a local refusal, never evidence (DEC-225).
+#[cfg(feature = "block-size-2016")]
 pub const MAX_BLOCK_SIZE: usize = 2016;
+/// This build's block capacity in bytes (the `block-size-65536` tier, the first
+/// above `u16`; see the `block-size-2016` documentation).
+#[cfg(feature = "block-size-65536")]
+pub const MAX_BLOCK_SIZE: usize = 65536;
+
+// Every capacity and every block length the stack holds is a `u32` (DEC-224,
+// DEC-227), so a tier above it could not be stated.
+const _: () = assert!(MAX_BLOCK_SIZE <= u32::MAX as usize);
 
 /// Fixed header size in bytes for the current MoonBlokz block format.
 pub const HEADER_SIZE: usize = 122;
@@ -535,7 +552,9 @@ pub struct BlockBuilder {
     header: BlockHeader,
     payload: [u8; MAX_PAYLOAD_SIZE],
     payload_len: usize,
-    item_count: u16,
+    // `u32` for the balance count (DEC-222); a transaction payload's count stays
+    // `u16` and is bounded in `append_item`.
+    item_count: u32,
     max_node_id: u32,
 }
 
@@ -688,14 +707,19 @@ impl BlockBuilder {
                 actual: new_len,
             });
         }
+        let item_count = self
+            .item_count
+            .checked_add(1)
+            .ok_or(BlockError::MalformedBlock("too many balance entries"))?;
         self.payload[self.payload_len..new_len].copy_from_slice(bytes);
         self.payload_len = new_len;
-        self.item_count += 1;
-        self.payload[0..2].copy_from_slice(&self.item_count.to_le_bytes());
+        self.item_count = item_count;
+        self.payload[0..4].copy_from_slice(&self.item_count.to_le_bytes());
         let owner = ni.owner();
         if owner > self.max_node_id {
             self.max_node_id = owner;
-            self.payload[2..6].copy_from_slice(&self.max_node_id.to_le_bytes());
+            self.payload[BALANCE_MAX_NODE_ID_OFFSET..BALANCE_HEADER_SIZE]
+                .copy_from_slice(&self.max_node_id.to_le_bytes());
         }
         Ok(self)
     }
@@ -706,7 +730,8 @@ impl BlockBuilder {
     pub fn set_max_node_id(&mut self, max_node_id: u32) -> Result<&mut Self, BlockError> {
         self.ensure_managed_payload(PAYLOAD_TYPE_BALANCE)?;
         self.max_node_id = max_node_id;
-        self.payload[2..6].copy_from_slice(&self.max_node_id.to_le_bytes());
+        self.payload[BALANCE_MAX_NODE_ID_OFFSET..BALANCE_HEADER_SIZE]
+            .copy_from_slice(&self.max_node_id.to_le_bytes());
         Ok(self)
     }
 
@@ -722,8 +747,7 @@ impl BlockBuilder {
                     self.payload_len = 2;
                 }
                 PAYLOAD_TYPE_BALANCE => {
-                    self.payload[0..2].copy_from_slice(&0u16.to_le_bytes());
-                    self.payload[2..6].copy_from_slice(&0u32.to_le_bytes());
+                    self.payload[..BALANCE_HEADER_SIZE].fill(0);
                     self.payload_len = BALANCE_HEADER_SIZE;
                 }
                 _ => {}
@@ -734,6 +758,9 @@ impl BlockBuilder {
         Ok(())
     }
 
+    /// Appends one transaction. The payload's transaction count is a `u16`: a
+    /// protocol bound of 65 535 transactions per block (DEC-222), which limits the
+    /// count, not the block.
     fn append_item(&mut self, bytes: &[u8]) -> Result<&mut Self, BlockError> {
         let new_len = self.payload_len + bytes.len();
         if new_len > MAX_PAYLOAD_SIZE {
@@ -742,10 +769,12 @@ impl BlockBuilder {
                 actual: new_len,
             });
         }
+        let item_count = u16::try_from(self.item_count + 1)
+            .map_err(|_| BlockError::MalformedBlock("too many transactions"))?;
         self.payload[self.payload_len..new_len].copy_from_slice(bytes);
         self.payload_len = new_len;
-        self.item_count += 1;
-        self.payload[0..2].copy_from_slice(&self.item_count.to_le_bytes());
+        self.item_count = u32::from(item_count);
+        self.payload[0..2].copy_from_slice(&item_count.to_le_bytes());
         Ok(self)
     }
 
@@ -1000,6 +1029,68 @@ mod tests {
         assert_recovers(&builder.build_signed(&test_crypto()).unwrap());
     }
 
+    /// DEC-222: the balance count is a `u32`. No shipped tier holds more than
+    /// 65 535 entries, so the width is proven on hand-built bytes.
+    #[test]
+    fn balance_count_is_read_as_a_u32() {
+        let mut bytes = [0u8; HEADER_SIZE + BALANCE_HEADER_SIZE];
+        bytes[VERSION_OFFSET] = 1;
+        bytes[PAYLOAD_TYPE_OFFSET] = PAYLOAD_TYPE_BALANCE;
+        bytes[PAYLOAD_OFFSET..PAYLOAD_OFFSET + 4].copy_from_slice(&65_537u32.to_le_bytes());
+        bytes[PAYLOAD_OFFSET + 4..PAYLOAD_OFFSET + 8].copy_from_slice(&7u32.to_le_bytes());
+        let view = BlockView::from_bytes(&bytes).unwrap();
+        let balances = view.balances().unwrap();
+        assert_eq!(balances.count(), 65_537);
+        assert_eq!(balances.max_node_id(), 7);
+        // The declared count over-runs the bytes: no structural length.
+        assert_eq!(view.content_length(), None);
+    }
+
+    /// The 8-byte balance prefix still fits 39 entries per reference block.
+    #[cfg(feature = "block-size-2016")]
+    #[test]
+    fn a_reference_balance_block_holds_39_entries() {
+        let mut builder = BlockBuilder::new().header(BlockHeader {
+            payload_type: 0,
+            ..sample_header()
+        });
+        for owner in 0..39 {
+            builder
+                .add_node_info(&NodeInfo::new(owner, 1, 0, &[1u8; 32]))
+                .unwrap();
+        }
+        let fortieth = builder.add_node_info(&NodeInfo::new(39, 1, 0, &[1u8; 32]));
+        assert!(matches!(fortieth, Err(BlockError::PayloadTooLarge { .. })));
+    }
+
+    /// DEC-222: a transaction payload's count stays a `u16`, a protocol bound of
+    /// 65 535 transactions per block. No tier fits that many, so the bound is
+    /// driven through the builder's counter.
+    #[test]
+    fn the_65536th_transaction_is_refused() {
+        let mut builder = BlockBuilder::new().header(BlockHeader {
+            payload_type: 0,
+            ..sample_header()
+        });
+        builder
+            .add_transaction_bytes(&[3, 0, 0, 0, 0, 0, 0])
+            .unwrap();
+        builder.item_count = u32::from(u16::MAX);
+        let (len_before, count_before) = (
+            builder.payload_len,
+            [builder.payload[0], builder.payload[1]],
+        );
+        let result = builder.add_transaction_bytes(&[3, 0, 0, 0, 0, 0, 0]);
+        assert!(matches!(
+            result,
+            Err(BlockError::MalformedBlock("too many transactions"))
+        ));
+        // Refused before anything is written.
+        assert_eq!(builder.payload_len, len_before);
+        assert_eq!([builder.payload[0], builder.payload[1]], count_before);
+        assert_eq!(builder.item_count, u32::from(u16::MAX));
+    }
+
     #[test]
     fn content_length_recovers_a_chain_config_block() {
         let mut payload_builder = crate::chain_config::ChainConfigPayloadBuilder::new();
@@ -1032,9 +1123,9 @@ mod tests {
         builder.add_complex_transaction(&cx).unwrap();
         let block = builder.build_signed(&test_crypto()).unwrap();
 
-        // 5 (tx header) + 2 (counts) + 78 + 89 + 41 + 13 = 228, + the 2-byte
+        // 5 (tx header) + 2 (counts) + 79 + 89 + 41 + 13 = 229, + the 2-byte
         // payload transaction count, + the block header.
-        assert_eq!(block.len(), HEADER_SIZE + 2 + 228);
+        assert_eq!(block.len(), HEADER_SIZE + 2 + 229);
         assert_recovers(&block);
     }
 
@@ -1550,9 +1641,10 @@ mod tests {
             payload_type: 0,
             ..sample_header()
         });
-        // NODE_TRANSFER_SIZE = 101. Payload header = 2. Available = 1894 - 2 = 1892.
-        // 18 * 101 = 1818 <= 1892, 19 * 101 = 1919 > 1892.
-        for _ in 0..18 {
+        // NODE_TRANSFER_SIZE = 101 after the 2-byte count; on the reference tier
+        // 18 * 101 = 1818 <= 1892 and 19 * 101 = 1919 > 1892.
+        let fit = (MAX_PAYLOAD_SIZE - 2) / crate::transaction::NODE_TRANSFER_SIZE;
+        for _ in 0..fit {
             builder.add_node_transfer(&nt).unwrap();
         }
         let result = builder.add_node_transfer(&nt);

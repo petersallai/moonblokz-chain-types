@@ -13,10 +13,16 @@ categories = ["embedded", "no-std"]
 # Exactly one Schnorr backend must be enabled. The default is the embedded-
 # oriented crypto-bigint backend. Consumers selecting an alternate backend must
 # disable defaults, e.g. `default-features = false, features = ["schnorr-malachite"]`.
-default = ["schnorr-crypto-bigint"]
+default = ["schnorr-crypto-bigint", "block-size-2016"]
 schnorr-crypto-bigint = ["moonblokz-crypto/schnorr-crypto-bigint"]
 schnorr-malachite = ["moonblokz-crypto/schnorr-malachite"]
 schnorr-num-bigint-dig = ["moonblokz-crypto/schnorr-num-bigint-dig"]
+# Exactly one block-size tier must be enabled: the build's block capacity
+# (`MAX_BLOCK_SIZE`, DEC-220). The chain's own maximum is configuration ID 3
+# `block_size_limit`, which acceptance bounds by this capacity. The tier is the
+# binary's choice, like the crypto backend: dependents forward it.
+block-size-2016 = []
+block-size-65536 = []
 
 [dependencies]
 moonblokz-crypto = { path = "../moonblokz-crypto-lib", default-features = false }

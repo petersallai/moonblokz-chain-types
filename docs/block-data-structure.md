@@ -9,8 +9,12 @@ This document defines the canonical MoonBlokz block layout used by
 ## Overview
 
 Every block has two parts: a **fixed-size header** and a **variable-size
-payload**. The total size of a block is capped by a configuration parameter
-(`MAX_BLOCK_SIZE`).
+payload**. The total size of a block is capped twice: by the chain's
+`block_size_limit` (configuration ID 3, the consensus rule) and by the build's
+capacity `MAX_BLOCK_SIZE`, which a build selects with a block-size tier feature
+(`block-size-2016` by default, or `block-size-65536`). Acceptance refuses a chain
+whose `block_size_limit` exceeds the build's capacity, so a block above the
+capacity is a local refusal, never evidence of invalidity.
 
 - A `Block` stores serialized bytes in a fixed `[u8; MAX_BLOCK_SIZE]` buffer.
 - The logical block length is tracked internally and exposed via `serialized_bytes()`.
@@ -24,7 +28,7 @@ vulnerabilities.
 
 ## Constants
 
-- `MAX_BLOCK_SIZE = 2016`
+- `MAX_BLOCK_SIZE` = 2016 (`block-size-2016`, the reference LoRa tier) or 65 536 (`block-size-65536`)
 - `HEADER_SIZE = 122`
 - `MAX_PAYLOAD_SIZE = MAX_BLOCK_SIZE - HEADER_SIZE`
 
@@ -57,7 +61,7 @@ The most complex block type with many possible layouts.
 
 | Field | Type | Description |
 |---|---|---|
-| `transaction_count` | `u16` | Number of transactions. Max 65 535, limited in practice by `MAX_BLOCK_SIZE`. |
+| `transaction_count` | `u16` | Number of transactions. A protocol bound of 65 535 transactions per block: it limits the count, not the block (a transaction can be up to `MAX_TRANSACTION_SIZE`, and a carry-forward merges up to 255 outputs). |
 
 Followed by a list of transactions. Each transaction has a common header:
 
@@ -111,8 +115,8 @@ calculated based on the transaction's byte size.
 
 | Field | Type | Description |
 |---|---|---|
-| `input_count` | `u8` | Number of inputs (0–255; 0 = special snake-chain re-add case). |
-| `output_count` | `u8` | Number of outputs (1–255). |
+| `input_count` | `u8` | Number of inputs (0–255; 0 = special snake-chain re-add case). A per-transaction protocol bound; the builder refuses the 256th. |
+| `output_count` | `u8` | Number of outputs (1–255). A per-transaction protocol bound; the builder refuses the 256th. |
 
 Followed by inputs and outputs. Each starts with a `type: u8` field.
 
@@ -121,7 +125,7 @@ Followed by inputs and outputs. Each starts with a `type: u8` field.
 | Field | Type | Description |
 |---|---|---|
 | `block_sequence` | `u32` (LE) | Sequence of the block that holds the UTXO output to spend. It must be a strict ancestor of the consuming block (ADR-016). |
-| `output_index` | `u8` | Position of the output in that block's UTXO-output stream: UTXO outputs only, transaction by transaction in block order, output by output within each transaction. |
+| `output_index` | `u16` (LE) | Position of the output in that block's UTXO-output stream: UTXO outputs only, transaction by transaction in block order, output by output within each transaction. |
 | `amount` | `u64` (LE) | The referenced output's amount, declared by the spender (DEC-131). It must equal the output's amount; it makes the complex transaction's input sum and fee decidable from its bytes. |
 | `signature` | `[u8; 64]` | Signature of this input & all outputs, signed with the private key corresponding to the UTXO's public key. |
 
@@ -156,7 +160,7 @@ Simpler structure than transactions, allowing more entries per block.
 
 | Field | Type | Description |
 |---|---|---|
-| `nodeinfo_count` | `u16` | Number of balance entries. The two-byte representation implicitly caps `MAX_BLOCK_SIZE` at ~3 MB (48 × 65 535). |
+| `nodeinfo_count` | `u32` (LE) | Number of balance entries. Four bytes, so a large-tier balance block is never split by its count. |
 | `max_node_id` | `u32` | Highest node identifier — helps nodes verify they have information for every node. Also represents the total node count since ids are sequential. |
 
 **Per NodeInfo entry (48 bytes):**
@@ -177,7 +181,7 @@ by node #0.
 
 | Field | Type | Description |
 |---|---|---|
-| `config_value_count` | `u16` | Number of override entries. |
+| `config_value_count` | `u16` | Number of override entries. Bounded by the protocol, not the block: duplicate identifiers are refused, so at most 126 entries. |
 | `config_values` | `count × entry` | The entries, back-to-back with no padding. |
 | `content_signature` | `[u8; SIGNATURE_SIZE]` | Node #0's signature over the content region. |
 
