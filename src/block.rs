@@ -1554,6 +1554,15 @@ mod tests {
                 + AGGREGATED_SIGNATURE_VARIABLE_SIZE * 40
                 + 2
         );
+        // The late-entry room in a 2 016 B block (configuration ID 3's
+        // default), as the builder computes it.
+        let room = (2016 - HEADER_SIZE - fixed) / APPROVAL_LATE_ENTRY_SIZE;
+        #[cfg(feature = "schnorr")]
+        assert_eq!(room, 69);
+        #[cfg(feature = "bls-min-sig")]
+        assert_eq!(room, 229);
+        #[cfg(feature = "bls-min-pk")]
+        assert_eq!(room, 217);
     }
 
     #[test]
