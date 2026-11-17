@@ -37,6 +37,10 @@ pub mod transaction;
 // in every scheme, which the layouts rely on.
 const _: () = assert!(moonblokz_crypto::MULTI_SIGNATURE_SIZE == moonblokz_crypto::SIGNATURE_SIZE);
 
+/// The scheme's wire sizes, re-exported for crates that frame chain data without a
+/// crypto dependency of their own (DEC-251).
+pub use moonblokz_crypto::{PUBLIC_KEY_SIZE, SIGNATURE_SIZE};
+
 pub use balance::{
     BalanceBlockPayloadView, BalanceIterator, NODE_INFO_SIZE, NodeInfo, NodeInfoView,
 };
