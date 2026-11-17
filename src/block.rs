@@ -33,7 +33,10 @@ use crate::hash::{HASH_SIZE, calculate_hash};
 use crate::transaction::{
     ComplexTransaction, NodeTransfer, Registration, TransactionBlockPayloadView,
 };
-use moonblokz_crypto::{CryptoTrait, SIGNATURE_SIZE, SignatureTrait};
+use moonblokz_crypto::{
+    AGGREGATED_SIGNATURE_CONSTANT_SIZE, AGGREGATED_SIGNATURE_VARIABLE_SIZE, CryptoTrait,
+    MAX_AGGREGATED_SIGNATURES, SIGNATURE_SIZE, SignatureTrait,
+};
 
 /// This build's block capacity in bytes: the largest encoded block it can
 /// frame, hold and store.
@@ -274,13 +277,9 @@ impl<'a> BlockView<'a> {
     /// declared count that over-runs the buffer, or a computed length beyond
     /// the slice.
     ///
-    /// `payload_type == 4` (approval evidence) has no wire format defined
-    /// anywhere yet, so its length is undecidable in general. Only the empty
-    /// payload — the sole shape constructible today — is answered, and any
-    /// non-zero approval payload yields `None`. When Epic 6 (FR12/FR27) defines
-    /// the approval framing it **must** extend this arm; until it does, a
-    /// restart refuses to recover such a block's length rather than silently
-    /// truncating it to a header and computing a wrong hash.
+    /// `payload_type == 4` (approval evidence) is framed from its own fields
+    /// (DEC-195, see [`ApprovalView`]); its bytes after the framed length are
+    /// padding, as for every other type.
     pub fn content_length(&self) -> Option<usize> {
         let payload = self.payload();
         let payload_len = match self.payload_type() {
@@ -289,15 +288,7 @@ impl<'a> BlockView<'a> {
             PAYLOAD_TYPE_CHAIN_CONFIG => {
                 crate::chain_config::content_end(payload)?.checked_add(SIGNATURE_SIZE)?
             }
-            // FR12/FR27 — Epic 6 must extend this arm when the approval payload
-            // gains a format. Answering `HEADER_SIZE` for a non-empty payload
-            // would be a guess, and a wrong block hash is worse than a refusal.
-            PAYLOAD_TYPE_APPROVAL => {
-                if payload.iter().any(|byte| *byte != 0) {
-                    return None;
-                }
-                0
-            }
+            PAYLOAD_TYPE_APPROVAL => approval_content_len(payload)?,
             _ => return None,
         };
 
@@ -331,6 +322,102 @@ impl<'a> BlockView<'a> {
             return None;
         }
         ChainConfigBlockPayloadView::from_payload(self.payload())
+    }
+}
+
+/// Offset of the approval evidence's signer bitmap: the payload starts with
+/// `supporter_vote_sum u64 ‖ deviation_sequence u32 ‖ m u8` (DEC-195).
+pub const APPROVAL_PREFIX_SIZE: usize = 13;
+/// Size of one approval late-node entry, `node_id u32 ‖ accumulated_vote u32`
+/// (DEC-184, DEC-195).
+pub const APPROVAL_LATE_ENTRY_SIZE: usize = 8;
+/// Offset of the approval evidence's `deviation_sequence u32`; the
+/// `supporter_vote_sum u64` precedes it at offset 0.
+pub const APPROVAL_DEVIATION_SEQUENCE_OFFSET: usize = 8;
+/// Offset of the approval evidence's subgroup size `m u8`.
+pub const APPROVAL_M_OFFSET: usize = 12;
+/// `late_count` is a `u16` (DEC-242): a protocol bound of 65 535 late entries.
+/// It is the last field of [`approval_fixed_size`].
+pub const APPROVAL_LATE_COUNT_SIZE: usize = 2;
+/// The largest subgroup an evidence can name: `m = 2·r − 1` with
+/// `r ≤ MAX_AGGREGATED_SIGNATURES` (ADR-015).
+pub const APPROVAL_MAX_SUBGROUP: usize = 2 * MAX_AGGREGATED_SIGNATURES - 1;
+
+// `m` and a subgroup rank travel as a `u8`.
+const _: () = assert!(APPROVAL_MAX_SUBGROUP <= u8::MAX as usize);
+
+/// Length of an approval evidence payload without its late entries, for a
+/// subgroup of `m` and `n` signers: prefix, the `⌈m/8⌉ B` bitmap, the
+/// aggregated signature and `late_count`. The late-count field is its last two
+/// bytes. The one statement of the DEC-195 layout, shared by the framing and
+/// the writer.
+pub const fn approval_fixed_size(m: usize, n: usize) -> usize {
+    APPROVAL_PREFIX_SIZE
+        + m.div_ceil(8)
+        + AGGREGATED_SIGNATURE_CONSTANT_SIZE
+        + AGGREGATED_SIGNATURE_VARIABLE_SIZE * n
+        + APPROVAL_LATE_COUNT_SIZE
+}
+
+/// Frames an approval evidence payload (DEC-195, little-endian):
+/// `supporter_vote_sum u64 ‖ deviation_sequence u32 ‖ m u8 ‖ signer bitmap
+/// (⌈m/8⌉ B) ‖ aggregated signature ‖ late_count u16 ‖ late entries
+/// (node_id u32 ‖ accumulated_vote u32) × late_count`.
+///
+/// `n`, the bitmap's population count, sizes the aggregate. Bits at positions
+/// `≥ m` are counted but not judged here (that is Tier 1's). `None` for an `m`
+/// above `2·MAX_AGGREGATED_SIGNATURES − 1`, `n == 0`, `n` above
+/// `MAX_AGGREGATED_SIGNATURES`, a Schnorr aggregate whose `count` is not `n`,
+/// or a frame longer than `payload`.
+fn approval_content_len(payload: &[u8]) -> Option<usize> {
+    let m = usize::from(*payload.get(APPROVAL_M_OFFSET)?);
+    if m > APPROVAL_MAX_SUBGROUP {
+        return None;
+    }
+    let bitmap = payload.get(APPROVAL_PREFIX_SIZE..APPROVAL_PREFIX_SIZE + m.div_ceil(8))?;
+    let n = bitmap
+        .iter()
+        .map(|byte| byte.count_ones() as usize)
+        .sum::<usize>();
+    if n == 0 || n > MAX_AGGREGATED_SIGNATURES {
+        return None;
+    }
+    // Schnorr's aggregate leads with its big-endian signer count.
+    #[cfg(feature = "schnorr")]
+    {
+        let at = APPROVAL_PREFIX_SIZE + bitmap.len();
+        let count = payload.get(at..at + 2)?;
+        if usize::from(u16::from_be_bytes([count[0], count[1]])) != n {
+            return None;
+        }
+    }
+    let fixed = approval_fixed_size(m, n);
+    let late_count = payload.get(fixed - APPROVAL_LATE_COUNT_SIZE..fixed)?;
+    let late_count = usize::from(u16::from_le_bytes([late_count[0], late_count[1]]));
+    let len = fixed + APPROVAL_LATE_ENTRY_SIZE * late_count;
+    (len <= payload.len()).then_some(len)
+}
+
+/// Borrowed view of an approval evidence payload (`payload_type == 4`).
+///
+/// Framed like [`BlockView::content_length`]'s approval arm. Story 6.6 reads
+/// only the deviation it approves; Story 6.7 adds the other accessors.
+pub struct ApprovalView<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> ApprovalView<'a> {
+    /// Frames `payload` as approval evidence; `None` when it does not frame.
+    pub fn from_payload(payload: &'a [u8]) -> Option<Self> {
+        let len = approval_content_len(payload)?;
+        Some(Self {
+            bytes: &payload[..len],
+        })
+    }
+
+    /// The sequence of the deviation block this evidence approves.
+    pub fn deviation_sequence(&self) -> u32 {
+        read_u32_le(self.bytes, APPROVAL_DEVIATION_SEQUENCE_OFFSET)
     }
 }
 
@@ -691,6 +778,30 @@ impl BlockBuilder {
         self.payload[..bytes.len()].copy_from_slice(bytes);
         self.payload_len = bytes.len();
         Ok(self)
+    }
+
+    /// Sets the approval evidence payload's length to `len` and hands out the
+    /// builder's own payload buffer to write it in place.
+    ///
+    /// The evidence is written straight into this buffer (and the aggregate
+    /// serialized into it) so that no second payload-sized buffer is needed on
+    /// the stack: the copy-in setters' pattern is departed from for that reason
+    /// only. Sets `payload_type` to `PAYLOAD_TYPE_APPROVAL`; refused when the
+    /// header names another type or `len > MAX_PAYLOAD_SIZE`. It may be called
+    /// again to change the length; the buffer's contents are kept.
+    pub fn approval_payload_mut(&mut self, len: usize) -> Result<&mut [u8], BlockError> {
+        if self.header.payload_type != 0 && self.header.payload_type != PAYLOAD_TYPE_APPROVAL {
+            return Err(BlockError::MalformedBlock("payload type mismatch"));
+        }
+        if len > MAX_PAYLOAD_SIZE {
+            return Err(BlockError::PayloadTooLarge {
+                max: MAX_PAYLOAD_SIZE,
+                actual: len,
+            });
+        }
+        self.header.payload_type = PAYLOAD_TYPE_APPROVAL;
+        self.payload_len = len;
+        Ok(&mut self.payload[..len])
     }
 
     /// Adds a node-info balance entry to the block payload.
@@ -1258,25 +1369,224 @@ mod tests {
         assert_eq!(view.content_length(), None);
     }
 
-    /// The approval payload has no wire format yet (Epic 6, FR12/FR27). The
-    /// empty shape — the only one constructible today — is answered; anything
-    /// else refuses, so a future non-empty approval payload breaks loudly here
-    /// instead of silently truncating to a header and hashing the wrong bytes.
+    // ===================================================================
+    // Approval evidence framing (DEC-195, Story 6.6 AC2)
+    // ===================================================================
+
+    const APPROVAL_DEVIATION: u32 = 77;
+
+    /// Writes an evidence payload for a subgroup of `m` whose ranks `held` signed
+    /// (a real aggregate, signers in rank order) with `late` late entries, and
+    /// returns its framed length.
+    fn write_approval(out: &mut [u8], m: u8, held: &[usize], late: u16) -> usize {
+        use moonblokz_crypto::{AggregatedSignatureTrait, MultiSignature, PublicKeyTrait};
+        let message = b"approval-test";
+        let mut sigs: [Option<MultiSignature>; MAX_AGGREGATED_SIGNATURES] =
+            core::array::from_fn(|_| None);
+        let mut keys = [[0u8; PUBLIC_KEY_SIZE]; MAX_AGGREGATED_SIGNATURES];
+        for (i, rank) in held.iter().enumerate() {
+            let signer = Crypto::new([*rank as u8 + 1; PRIVATE_KEY_SIZE])
+                .ok()
+                .expect("test key");
+            sigs[i] = Some(signer.multi_sign(message));
+            keys[i] = *signer.public_key().serialize();
+        }
+        let sig_refs: [&MultiSignature; MAX_AGGREGATED_SIGNATURES] =
+            core::array::from_fn(|i| sigs[i.min(held.len() - 1)].as_ref().expect("signed"));
+        let key_refs: [&[u8; PUBLIC_KEY_SIZE]; MAX_AGGREGATED_SIGNATURES] =
+            core::array::from_fn(|i| &keys[i]);
+        let aggregate = test_crypto()
+            .aggregate_signatures(&sig_refs[..held.len()], &key_refs[..held.len()], message)
+            .ok()
+            .expect("aggregates");
+
+        out[..8].copy_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+        out[8..12].copy_from_slice(&APPROVAL_DEVIATION.to_le_bytes());
+        out[12] = m;
+        let bitmap = APPROVAL_PREFIX_SIZE..APPROVAL_PREFIX_SIZE + usize::from(m).div_ceil(8);
+        out[bitmap.clone()].fill(0);
+        for rank in held {
+            out[APPROVAL_PREFIX_SIZE + rank / 8] |= 1 << (rank % 8);
+        }
+        let written = aggregate
+            .serialize(&mut out[bitmap.end..])
+            .ok()
+            .expect("serializes");
+        let fixed = approval_fixed_size(usize::from(m), held.len());
+        assert_eq!(
+            bitmap.end + written + 2,
+            fixed,
+            "layout agrees with the writer"
+        );
+        out[fixed - 2..fixed].copy_from_slice(&late.to_le_bytes());
+        for i in 0..usize::from(late) {
+            let at = fixed + APPROVAL_LATE_ENTRY_SIZE * i;
+            out[at..at + 4].copy_from_slice(&(i as u32 + 100).to_le_bytes());
+            out[at + 4..at + 8].copy_from_slice(&(i as u32 * 10).to_le_bytes());
+        }
+        fixed + APPROVAL_LATE_ENTRY_SIZE * usize::from(late)
+    }
+
+    fn approval_block(m: u8, held: &[usize], late: u16) -> Block {
+        let mut builder = BlockBuilder::new().header(BlockHeader {
+            payload_type: 0,
+            ..sample_header()
+        });
+        let buffer = builder
+            .approval_payload_mut(MAX_PAYLOAD_SIZE)
+            .expect("type 0");
+        let len = write_approval(buffer, m, held, late);
+        builder.approval_payload_mut(len).expect("shrinks");
+        builder.build_signed(&test_crypto()).expect("signs")
+    }
+
+    /// Story 6.6 AC2: the evidence frames from its own fields, and a bit flip
+    /// in the padding after it no longer loses the block (deferred-work D52).
     #[test]
-    fn content_length_answers_an_empty_approval_and_refuses_a_populated_one() {
+    fn content_length_frames_an_approval_and_ignores_its_padding() {
+        let block = approval_block(5, &[0, 2, 4], 2);
+        assert_eq!(block.view().payload_type(), PAYLOAD_TYPE_APPROVAL);
+        assert_recovers(&block);
+
+        let exact = block.len();
+        let mut slot = padded_slot(&block);
+        slot[exact] = 0xFF;
+        slot[MAX_BLOCK_SIZE - 1] = 0x01;
+        let view = BlockView::from_bytes(&slot).expect("parses");
+        assert_eq!(view.content_length(), Some(exact));
+    }
+
+    /// The pin that used to answer an all-zero approval flips: a type-4 block
+    /// always carries its content, so the empty payload no longer frames; and
+    /// every malformed shape of AC2 refuses rather than guesses.
+    #[test]
+    fn content_length_refuses_an_empty_or_malformed_approval() {
         let mut bytes = [0u8; MAX_BLOCK_SIZE];
         bytes[VERSION_OFFSET] = 1;
         bytes[PAYLOAD_TYPE_OFFSET] = PAYLOAD_TYPE_APPROVAL;
-        let view = BlockView::from_bytes(&bytes).expect("parses");
-        assert_eq!(view.content_length(), Some(HEADER_SIZE));
+        let empty = BlockView::from_bytes(&bytes[..HEADER_SIZE]).expect("parses");
+        assert_eq!(empty.content_length(), None, "the empty payload");
+        let zeros = BlockView::from_bytes(&bytes).expect("parses");
+        assert_eq!(zeros.content_length(), None, "an all-zero payload: n == 0");
 
-        bytes[PAYLOAD_OFFSET] = 1;
-        let view = BlockView::from_bytes(&bytes).expect("parses");
+        let block = approval_block(5, &[0, 2, 4], 2);
+        let exact = block.len();
+        let base = padded_slot(&block);
+        let frames = |mutate: &dyn Fn(&mut [u8; MAX_BLOCK_SIZE]), len: usize| {
+            let mut slot = base;
+            mutate(&mut slot);
+            BlockView::from_bytes(&slot[..len])
+                .expect("parses")
+                .content_length()
+        };
+        let p = HEADER_SIZE;
+        assert_eq!(frames(&|_| {}, exact), Some(exact), "the passing fixture");
         assert_eq!(
-            view.content_length(),
+            frames(&|_| {}, exact - 1),
             None,
-            "Epic 6 must extend the approval arm before such a block can restart"
+            "frame longer than the slice"
         );
+        assert_eq!(
+            frames(
+                &|s| s[p + 12] = (2 * MAX_AGGREGATED_SIGNATURES) as u8,
+                MAX_BLOCK_SIZE
+            ),
+            None,
+            "m above 2·MAX_AGGREGATED_SIGNATURES − 1"
+        );
+        assert_eq!(
+            frames(&|s| s[p + APPROVAL_PREFIX_SIZE] = 0, MAX_BLOCK_SIZE),
+            None,
+            "n == 0"
+        );
+        assert_eq!(
+            frames(
+                &|s| {
+                    s[p + 12] = (2 * MAX_AGGREGATED_SIGNATURES - 1) as u8;
+                    let bitmap = (2 * MAX_AGGREGATED_SIGNATURES - 1).div_ceil(8);
+                    s[p + APPROVAL_PREFIX_SIZE..p + APPROVAL_PREFIX_SIZE + bitmap].fill(0xFF);
+                },
+                MAX_BLOCK_SIZE
+            ),
+            None,
+            "n above MAX_AGGREGATED_SIGNATURES"
+        );
+        let fixed = approval_fixed_size(5, 3);
+        assert_eq!(
+            frames(
+                &|s| s[p + fixed - 2..p + fixed].copy_from_slice(&u16::MAX.to_le_bytes()),
+                MAX_BLOCK_SIZE
+            ),
+            None,
+            "late_count overflows the frame"
+        );
+        #[cfg(feature = "schnorr")]
+        assert_eq!(
+            frames(&|s| s[p + APPROVAL_PREFIX_SIZE] |= 1 << 1, MAX_BLOCK_SIZE),
+            None,
+            "a Schnorr aggregate whose count is not the bitmap's population"
+        );
+    }
+
+    #[test]
+    fn approval_view_reads_the_deviation_and_frames_like_content_length() {
+        let block = approval_block(9, &[1, 8], 0);
+        let view = ApprovalView::from_payload(block.view().payload()).expect("frames");
+        assert_eq!(view.deviation_sequence(), APPROVAL_DEVIATION);
+        assert!(ApprovalView::from_payload(&[0u8; 64]).is_none());
+    }
+
+    /// The fixed part is computed from the crypto constants; at
+    /// `required_support = 40` (`m = 79`) it is the KB's figure per scheme.
+    #[test]
+    fn approval_fixed_size_matches_the_ratified_layout_figures() {
+        let fixed = approval_fixed_size(79, 40);
+        #[cfg(feature = "schnorr")]
+        assert_eq!(fixed, 1339);
+        #[cfg(feature = "bls-min-sig")]
+        assert_eq!(fixed, 75);
+        #[cfg(feature = "bls-min-pk")]
+        assert_eq!(fixed, 123);
+        assert_eq!(
+            fixed,
+            13 + 10
+                + AGGREGATED_SIGNATURE_CONSTANT_SIZE
+                + AGGREGATED_SIGNATURE_VARIABLE_SIZE * 40
+                + 2
+        );
+        // The late-entry room in a 2 016 B block (configuration ID 3's
+        // default), as the builder computes it.
+        let room = (2016 - HEADER_SIZE - fixed) / APPROVAL_LATE_ENTRY_SIZE;
+        #[cfg(feature = "schnorr")]
+        assert_eq!(room, 69);
+        #[cfg(feature = "bls-min-sig")]
+        assert_eq!(room, 229);
+        #[cfg(feature = "bls-min-pk")]
+        assert_eq!(room, 217);
+    }
+
+    #[test]
+    fn approval_payload_mut_sets_the_type_and_refuses_a_mismatch() {
+        let mut builder = BlockBuilder::new().header(sample_header());
+        assert!(
+            builder.approval_payload_mut(4).is_err(),
+            "header names type 3"
+        );
+
+        let mut builder = BlockBuilder::new().header(BlockHeader {
+            payload_type: 0,
+            ..sample_header()
+        });
+        assert!(builder.approval_payload_mut(MAX_PAYLOAD_SIZE + 1).is_err());
+        builder.approval_payload_mut(4).expect("type 0")[3] = 0xAB;
+        assert_eq!(builder.approval_payload_mut(8).expect("again")[3], 0xAB);
+        assert!(
+            builder.add_transaction_bytes(&[0u8; 4]).is_err(),
+            "no transaction after it"
+        );
+        let block = builder.build_signed(&test_crypto()).expect("signs");
+        assert_eq!(block.view().payload_type(), PAYLOAD_TYPE_APPROVAL);
+        assert_eq!(block.len(), HEADER_SIZE + 8);
     }
 
     /// For a block parsed from its exact wire bytes the two lengths agree; the
