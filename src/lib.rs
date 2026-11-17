@@ -6,22 +6,16 @@ for deterministic integration with MoonBlokz storage and chain logic.
 
 #![no_std]
 
-#[cfg(not(any(
-    feature = "schnorr-crypto-bigint",
-    feature = "schnorr-malachite",
-    feature = "schnorr-num-bigint-dig"
-)))]
+// Exactly one signature scheme (DEC-246); the crypto crate enforces the same rule.
+#[cfg(not(any(feature = "schnorr", feature = "bls-min-sig", feature = "bls-min-pk")))]
 compile_error!(
-    "moonblokz-chain-types requires exactly one Schnorr backend feature; keep the default `schnorr-crypto-bigint`, or choose an alternate with `default-features = false`"
+    "moonblokz-chain-types requires one signature-scheme feature: keep the default `schnorr`, or choose `bls-min-sig` / `bls-min-pk` with `default-features = false`"
 );
 
-#[cfg(any(
-    all(feature = "schnorr-crypto-bigint", feature = "schnorr-malachite"),
-    all(feature = "schnorr-crypto-bigint", feature = "schnorr-num-bigint-dig"),
-    all(feature = "schnorr-malachite", feature = "schnorr-num-bigint-dig")
-))]
+// The wire layouts below are Schnorr-sized; BLS on the chain is Story 6.17.
+#[cfg(any(feature = "bls-min-sig", feature = "bls-min-pk"))]
 compile_error!(
-    "moonblokz-chain-types requires exactly one Schnorr backend feature; disable default features when selecting an alternate backend"
+    "moonblokz-chain-types: BLS on the chain is Story 6.17; the wire layouts are Schnorr-sized until then"
 );
 
 // Exactly one block-size tier: the build's block capacity (DEC-220). It is a

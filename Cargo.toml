@@ -10,13 +10,13 @@ keywords = ["embedded", "no-std", "blockchain", "types", "sha256"]
 categories = ["embedded", "no-std"]
 
 [features]
-# Exactly one Schnorr backend must be enabled. The default is the embedded-
-# oriented crypto-bigint backend. Consumers selecting an alternate backend must
-# disable defaults, e.g. `default-features = false, features = ["schnorr-malachite"]`.
-default = ["schnorr-crypto-bigint", "block-size-2016"]
-schnorr-crypto-bigint = ["moonblokz-crypto/schnorr-crypto-bigint"]
-schnorr-malachite = ["moonblokz-crypto/schnorr-malachite"]
-schnorr-num-bigint-dig = ["moonblokz-crypto/schnorr-num-bigint-dig"]
+# Exactly one signature scheme must be enabled (DEC-246): `schnorr` (default),
+# `bls-min-sig` or `bls-min-pk`. The chain's wire layouts are Schnorr-sized until
+# Story 6.17, so the BLS schemes are refused at compile time for now.
+default = ["schnorr", "block-size-2016"]
+schnorr = ["moonblokz-crypto/schnorr"]
+bls-min-sig = ["moonblokz-crypto/bls-min-sig"]
+bls-min-pk = ["moonblokz-crypto/bls-min-pk"]
 # Exactly one block-size tier must be enabled: the build's block capacity
 # (`MAX_BLOCK_SIZE`, DEC-220). The chain's own maximum is configuration ID 3
 # `block_size_limit`, which acceptance bounds by this capacity. The tier is the
@@ -26,4 +26,4 @@ block-size-65536 = []
 
 [dependencies]
 moonblokz-crypto = { path = "../moonblokz-crypto-lib", default-features = false }
-sha2 = { version = "0.10", default-features = false }
+sha2 = { version = "0.11", default-features = false }

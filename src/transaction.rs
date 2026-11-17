@@ -633,9 +633,12 @@ impl Registration {
 
     /// Creates and signs a registration transaction.
     ///
-    /// The new-key signature signs the new public key bytes. The transaction
-    /// signature then signs the complete transaction bytes with the transaction
-    /// signature field zero-filled and the new-key signature already present.
+    /// The new-key signature is `crypto`'s proof of possession
+    /// (`CryptoTrait::prove_possession`, DEC-248): a signature in a domain of its
+    /// own over `crypto`'s public key, which is meant to be `new_public_key`. The
+    /// transaction signature then signs the complete transaction bytes with the
+    /// transaction signature field zero-filled and the new-key signature already
+    /// present.
     #[allow(clippy::too_many_arguments)]
     pub fn new_signed<Crypto: CryptoTrait>(
         vote: u32,
@@ -657,7 +660,7 @@ impl Registration {
             &zero_signature,
             &zero_signature,
         );
-        let new_key_signature = crypto.sign(new_public_key);
+        let new_key_signature = crypto.prove_possession();
         tx.data[REGISTRATION_NEW_KEY_SIGNATURE_OFFSET..REGISTRATION_SIGNATURE_OFFSET]
             .copy_from_slice(new_key_signature.serialize());
         let signature = crypto.sign(&tx.data);
