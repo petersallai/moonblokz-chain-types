@@ -392,7 +392,7 @@ mod tests {
             first_voted_node: 0,
             consumed_votes_from_first_voted_node: 0,
             previous_hash: [0; 32],
-            signature: [0; 64],
+            signature: [0; SIGNATURE_SIZE],
         }
     }
 

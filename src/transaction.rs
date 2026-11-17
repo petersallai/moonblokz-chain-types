@@ -8,7 +8,7 @@ owned byte arrays for constructing transactions before adding them to a block.
 use crate::block::{MAX_PAYLOAD_SIZE, read_u32_le, read_u64_le};
 use crate::error::BlockError;
 use crate::hash::{HASH_SIZE, calculate_hash};
-use moonblokz_crypto::{CryptoTrait, SignatureTrait};
+use moonblokz_crypto::{CryptoTrait, PUBLIC_KEY_SIZE, SIGNATURE_SIZE, SignatureTrait};
 
 // Transaction type discriminators.
 const TX_TYPE_NODE_TRANSFER: u8 = 1;
@@ -18,13 +18,19 @@ const TX_TYPE_COMPLEX: u8 = 3;
 // Transaction common header: type(1) + vote(4) = 5 bytes.
 const TX_HEADER_SIZE: usize = 5;
 
-// Body sizes (after common header).
-const NODE_TRANSFER_BODY_SIZE: usize = 96;
-const REGISTRATION_BODY_SIZE: usize = 184;
+// Body sizes (after common header), derived from the scheme's sizes (DEC-251): the
+// signatures close each record, so every fixed field keeps its offset.
+// Node transfer: anchor_sequence u32 ‖ initializer u32 ‖ receiver u32 ‖ amount u64 ‖
+// fee u32 ‖ comment u64 ‖ signature.
+const NODE_TRANSFER_BODY_SIZE: usize = 32 + SIGNATURE_SIZE;
+// Registration: initializer u32 ‖ new_node_id u32 ‖ registration_price u64 ‖ fee u64 ‖
+// new_public_key ‖ new_key_signature (the proof of possession) ‖ signature.
+const REGISTRATION_BODY_SIZE: usize = 24 + PUBLIC_KEY_SIZE + 2 * SIGNATURE_SIZE;
 
-const NODE_TRANSFER_SIGNATURE_OFFSET: usize = 37;
-const REGISTRATION_NEW_KEY_SIGNATURE_OFFSET: usize = 61;
-const REGISTRATION_SIGNATURE_OFFSET: usize = 125;
+const NODE_TRANSFER_SIGNATURE_OFFSET: usize = TX_HEADER_SIZE + 32;
+const REGISTRATION_NEW_KEY_OFFSET: usize = TX_HEADER_SIZE + 24;
+const REGISTRATION_NEW_KEY_SIGNATURE_OFFSET: usize = REGISTRATION_NEW_KEY_OFFSET + PUBLIC_KEY_SIZE;
+const REGISTRATION_SIGNATURE_OFFSET: usize = REGISTRATION_NEW_KEY_SIGNATURE_OFFSET + SIGNATURE_SIZE;
 
 /// Total encoded size of a node-transfer transaction (header + body).
 pub const NODE_TRANSFER_SIZE: usize = TX_HEADER_SIZE + NODE_TRANSFER_BODY_SIZE;
@@ -40,15 +46,19 @@ const UTXO_INPUT_BLOCK_SEQUENCE_OFFSET: usize = 0;
 const UTXO_INPUT_OUTPUT_INDEX_OFFSET: usize = UTXO_INPUT_BLOCK_SEQUENCE_OFFSET + 4;
 const UTXO_INPUT_AMOUNT_OFFSET: usize = UTXO_INPUT_OUTPUT_INDEX_OFFSET + 2;
 const UTXO_INPUT_SIGNATURE_OFFSET: usize = UTXO_INPUT_AMOUNT_OFFSET + 8;
-const UTXO_INPUT_SIGNATURE_SIZE: usize = 64;
+const UTXO_INPUT_SIGNATURE_SIZE: usize = SIGNATURE_SIZE;
 const UTXO_INPUT_BODY_SIZE: usize = UTXO_INPUT_SIGNATURE_OFFSET + UTXO_INPUT_SIGNATURE_SIZE;
 
 // Input sizes (including type byte).
 const UTXO_INPUT_SIZE: usize = 1 + UTXO_INPUT_BODY_SIZE;
-const BALANCE_INPUT_SIZE: usize = 89;
+// Balance input: type ‖ anchor_sequence u32 ‖ initializer u32 ‖ amount u64 ‖ comment u64 ‖
+// signature.
+const BALANCE_INPUT_SIGNATURE_OFFSET: usize = 24;
+const BALANCE_INPUT_SIZE: usize = 1 + BALANCE_INPUT_SIGNATURE_OFFSET + SIGNATURE_SIZE;
 
 // Output sizes (including type byte).
-const UTXO_OUTPUT_SIZE: usize = 41;
+// UTXO output: type ‖ address (the owner's public key, DEC-253) ‖ amount u64.
+const UTXO_OUTPUT_SIZE: usize = 1 + PUBLIC_KEY_SIZE + 8;
 const BALANCE_OUTPUT_SIZE: usize = 13;
 
 // Input type discriminators.
@@ -229,7 +239,7 @@ impl<'a> NodeTransferView<'a> {
         read_u64_le(self.data, 24)
     }
     pub fn signature(&self) -> &[u8] {
-        &self.data[32..96]
+        &self.data[32..32 + SIGNATURE_SIZE]
     }
 }
 
@@ -252,13 +262,13 @@ impl<'a> RegistrationView<'a> {
         read_u64_le(self.data, 16)
     }
     pub fn new_public_key(&self) -> &[u8] {
-        &self.data[24..56]
+        &self.data[24..24 + PUBLIC_KEY_SIZE]
     }
     pub fn new_key_signature(&self) -> &[u8] {
-        &self.data[56..120]
+        &self.data[24 + PUBLIC_KEY_SIZE..24 + PUBLIC_KEY_SIZE + SIGNATURE_SIZE]
     }
     pub fn signature(&self) -> &[u8] {
-        &self.data[120..184]
+        &self.data[24 + PUBLIC_KEY_SIZE + SIGNATURE_SIZE..REGISTRATION_BODY_SIZE]
     }
 }
 
@@ -488,7 +498,7 @@ impl<'a> BalanceInputView<'a> {
         read_u64_le(self.data, 16)
     }
     pub fn signature(&self) -> &[u8] {
-        &self.data[24..88]
+        &self.data[BALANCE_INPUT_SIGNATURE_OFFSET..BALANCE_INPUT_SIGNATURE_OFFSET + SIGNATURE_SIZE]
     }
 }
 
@@ -499,10 +509,10 @@ pub struct UtxoOutputView<'a> {
 
 impl<'a> UtxoOutputView<'a> {
     pub fn address(&self) -> &[u8] {
-        &self.data[0..32]
+        &self.data[0..PUBLIC_KEY_SIZE]
     }
     pub fn amount(&self) -> u64 {
-        read_u64_le(self.data, 32)
+        read_u64_le(self.data, PUBLIC_KEY_SIZE)
     }
 }
 
@@ -540,7 +550,7 @@ impl NodeTransfer {
         amount: u64,
         fee: u32,
         comment: u64,
-        signature: &[u8; 64],
+        signature: &[u8; SIGNATURE_SIZE],
     ) -> Self {
         let mut data = [0u8; NODE_TRANSFER_SIZE];
         data[0] = TX_TYPE_NODE_TRANSFER;
@@ -559,7 +569,7 @@ impl NodeTransfer {
     ///
     /// The signing input is the complete transaction byte sequence with the
     /// signature field zero-filled. The returned owned transaction stores the
-    /// signer-produced 64-byte signature in its signature field.
+    /// signer-produced signature (`SIGNATURE_SIZE` bytes) in its signature field.
     #[allow(clippy::too_many_arguments)]
     pub fn new_signed<Crypto: CryptoTrait>(
         vote: u32,
@@ -571,7 +581,7 @@ impl NodeTransfer {
         comment: u64,
         crypto: &Crypto,
     ) -> Self {
-        let zero_signature = [0u8; 64];
+        let zero_signature = [0u8; SIGNATURE_SIZE];
         let mut tx = Self::new(
             vote,
             anchor_sequence,
@@ -613,9 +623,9 @@ impl Registration {
         new_node_id: u32,
         registration_price: u64,
         fee: u64,
-        new_public_key: &[u8; 32],
-        new_key_signature: &[u8; 64],
-        signature: &[u8; 64],
+        new_public_key: &[u8; PUBLIC_KEY_SIZE],
+        new_key_signature: &[u8; SIGNATURE_SIZE],
+        signature: &[u8; SIGNATURE_SIZE],
     ) -> Self {
         let mut data = [0u8; REGISTRATION_SIZE];
         data[0] = TX_TYPE_REGISTRATION;
@@ -624,7 +634,8 @@ impl Registration {
         data[9..13].copy_from_slice(&new_node_id.to_le_bytes());
         data[13..21].copy_from_slice(&registration_price.to_le_bytes());
         data[21..29].copy_from_slice(&fee.to_le_bytes());
-        data[29..61].copy_from_slice(new_public_key);
+        data[REGISTRATION_NEW_KEY_OFFSET..REGISTRATION_NEW_KEY_SIGNATURE_OFFSET]
+            .copy_from_slice(new_public_key);
         data[REGISTRATION_NEW_KEY_SIGNATURE_OFFSET..REGISTRATION_SIGNATURE_OFFSET]
             .copy_from_slice(new_key_signature);
         data[REGISTRATION_SIGNATURE_OFFSET..REGISTRATION_SIZE].copy_from_slice(signature);
@@ -646,10 +657,10 @@ impl Registration {
         new_node_id: u32,
         registration_price: u64,
         fee: u64,
-        new_public_key: &[u8; 32],
+        new_public_key: &[u8; PUBLIC_KEY_SIZE],
         crypto: &Crypto,
     ) -> Self {
-        let zero_signature = [0u8; 64];
+        let zero_signature = [0u8; SIGNATURE_SIZE];
         let mut tx = Self::new(
             vote,
             initializer,
@@ -701,6 +712,11 @@ const _: () = assert!(BALANCE_INPUT_SIZE >= UTXO_INPUT_SIZE);
 const _: () = assert!(UTXO_OUTPUT_SIZE >= BALANCE_OUTPUT_SIZE);
 const _: () = assert!(NODE_TRANSFER_SIZE <= MAX_TRANSACTION_SIZE);
 const _: () = assert!(REGISTRATION_SIZE <= MAX_TRANSACTION_SIZE);
+// The builders' signature offsets and the body sizes are written independently;
+// the signature is the last field of both fixed-size transactions.
+const _: () = assert!(NODE_TRANSFER_SIGNATURE_OFFSET + SIGNATURE_SIZE == NODE_TRANSFER_SIZE);
+const _: () = assert!(REGISTRATION_SIGNATURE_OFFSET + SIGNATURE_SIZE == REGISTRATION_SIZE);
+const _: () = assert!(1 + UTXO_INPUT_SIGNATURE_OFFSET + SIGNATURE_SIZE == UTXO_INPUT_SIZE);
 
 /// Owned complex transaction builder for block construction.
 ///
@@ -769,7 +785,7 @@ impl ComplexTransaction {
         initializer: u32,
         amount: u64,
         comment: u64,
-        signature: &[u8; 64],
+        signature: &[u8; SIGNATURE_SIZE],
     ) -> Result<&mut Self, BlockError> {
         if self.outputs_started {
             return Err(BlockError::MalformedBlock(
@@ -790,7 +806,8 @@ impl ComplexTransaction {
         self.data[p + 5..p + 9].copy_from_slice(&initializer.to_le_bytes());
         self.data[p + 9..p + 17].copy_from_slice(&amount.to_le_bytes());
         self.data[p + 17..p + 25].copy_from_slice(&comment.to_le_bytes());
-        self.data[p + 25..p + 89].copy_from_slice(signature);
+        self.data[p + 1 + BALANCE_INPUT_SIGNATURE_OFFSET..p + BALANCE_INPUT_SIZE]
+            .copy_from_slice(signature);
         self.data[5] = input_count;
         self.len = new_len;
         Ok(self)
@@ -799,7 +816,7 @@ impl ComplexTransaction {
     /// Adds a UTXO output.
     pub fn add_utxo_output(
         &mut self,
-        address: &[u8; 32],
+        address: &[u8; PUBLIC_KEY_SIZE],
         amount: u64,
     ) -> Result<&mut Self, BlockError> {
         let output_count = self.next_output_count()?;
@@ -813,8 +830,9 @@ impl ComplexTransaction {
         self.outputs_started = true;
         let p = self.len;
         self.data[p] = OUTPUT_TYPE_UTXO;
-        self.data[p + 1..p + 33].copy_from_slice(address);
-        self.data[p + 33..p + 41].copy_from_slice(&amount.to_le_bytes());
+        self.data[p + 1..p + 1 + PUBLIC_KEY_SIZE].copy_from_slice(address);
+        self.data[p + 1 + PUBLIC_KEY_SIZE..p + UTXO_OUTPUT_SIZE]
+            .copy_from_slice(&amount.to_le_bytes());
         self.data[6] = output_count;
         self.len = new_len;
         Ok(self)
@@ -964,6 +982,7 @@ mod tests {
     use super::*;
     use crate::block::{BlockBuilder, BlockHeader};
     use moonblokz_crypto::{Crypto, CryptoTrait, PRIVATE_KEY_SIZE};
+    use moonblokz_crypto::{PUBLIC_KEY_SIZE, SIGNATURE_SIZE};
 
     fn test_crypto() -> Crypto {
         Crypto::new([1u8; PRIVATE_KEY_SIZE])
@@ -982,7 +1001,7 @@ mod tests {
             first_voted_node: 0,
             consumed_votes_from_first_voted_node: 0,
             previous_hash: [0; 32],
-            signature: [0; 64],
+            signature: [0; SIGNATURE_SIZE],
         };
         let mut builder = BlockBuilder::new().header(header);
         for tx in transactions {
@@ -999,8 +1018,8 @@ mod tests {
         fee: u32,
         comment: u64,
         vote: u32,
-    ) -> [u8; 101] {
-        let mut buf = [0u8; 101];
+    ) -> [u8; NODE_TRANSFER_SIZE] {
+        let mut buf = [0u8; NODE_TRANSFER_SIZE];
         buf[0] = TX_TYPE_NODE_TRANSFER;
         buf[1..5].copy_from_slice(&vote.to_le_bytes());
         buf[5..9].copy_from_slice(&anchor_seq.to_le_bytes());
@@ -1009,7 +1028,7 @@ mod tests {
         buf[17..25].copy_from_slice(&amount.to_le_bytes());
         buf[25..29].copy_from_slice(&fee.to_le_bytes());
         buf[29..37].copy_from_slice(&comment.to_le_bytes());
-        buf[37..101].fill(0xAA);
+        buf[NODE_TRANSFER_SIGNATURE_OFFSET..].fill(0xAA);
         buf
     }
 
@@ -1029,14 +1048,14 @@ mod tests {
 
     #[test]
     fn transaction_hash_methods_use_canonical_bytes() {
-        let sig = [0xAA; 64];
+        let sig = [0xAA; SIGNATURE_SIZE];
         let nt = NodeTransfer::new(99, 10, 1, 2, 1000, 5, 42, &sig);
         let nt_view = TransactionView::from_bytes(nt.as_bytes()).unwrap();
         assert_eq!(nt.hash(), calculate_hash(nt.as_bytes()));
         assert_eq!(nt_view.hash(), nt.hash());
 
-        let public_key = [0xBB; 32];
-        let key_sig = [0xCC; 64];
+        let public_key = [0xBB; PUBLIC_KEY_SIZE];
+        let key_sig = [0xCC; SIGNATURE_SIZE];
         let reg = Registration::new(50, 1, 42, 1000, 10, &public_key, &key_sig, &sig);
         let reg_view = TransactionView::from_bytes(reg.as_bytes()).unwrap();
         assert_eq!(reg.hash(), calculate_hash(reg.as_bytes()));
@@ -1069,7 +1088,7 @@ mod tests {
         assert_eq!(nt.amount(), 1000);
         assert_eq!(nt.fee(), 5);
         assert_eq!(nt.comment(), 42);
-        assert_eq!(nt.signature().len(), 64);
+        assert_eq!(nt.signature().len(), SIGNATURE_SIZE);
 
         assert!(tx.as_registration().is_none());
         assert!(tx.as_complex().is_none());
@@ -1087,7 +1106,7 @@ mod tests {
             first_voted_node: 0,
             consumed_votes_from_first_voted_node: 0,
             previous_hash: [0; 32],
-            signature: [0; 64],
+            signature: [0; SIGNATURE_SIZE],
         };
         let block = BlockBuilder::new()
             .header(header)
@@ -1122,9 +1141,9 @@ mod tests {
         tx_bytes[9..13].copy_from_slice(&42u32.to_le_bytes());
         tx_bytes[13..21].copy_from_slice(&1000u64.to_le_bytes());
         tx_bytes[21..29].copy_from_slice(&10u64.to_le_bytes());
-        tx_bytes[29..61].fill(0xCC);
-        tx_bytes[61..125].fill(0xDD);
-        tx_bytes[125..189].fill(0xEE);
+        tx_bytes[REGISTRATION_NEW_KEY_OFFSET..REGISTRATION_NEW_KEY_SIGNATURE_OFFSET].fill(0xCC);
+        tx_bytes[REGISTRATION_NEW_KEY_SIGNATURE_OFFSET..REGISTRATION_SIGNATURE_OFFSET].fill(0xDD);
+        tx_bytes[REGISTRATION_SIGNATURE_OFFSET..].fill(0xEE);
 
         let block = build_tx_block(&[&tx_bytes[..]]);
         let tx = block.transactions().unwrap().iter().next().unwrap();
@@ -1136,14 +1155,16 @@ mod tests {
         assert_eq!(reg.new_node_id(), 42);
         assert_eq!(reg.registration_price(), 1000);
         assert_eq!(reg.fee(), 10);
-        assert_eq!(reg.new_public_key(), &[0xCC; 32]);
-        assert_eq!(reg.new_key_signature(), &[0xDD; 64]);
-        assert_eq!(reg.signature(), &[0xEE; 64]);
+        assert_eq!(reg.new_public_key(), &[0xCC; PUBLIC_KEY_SIZE]);
+        assert_eq!(reg.new_key_signature(), &[0xDD; SIGNATURE_SIZE]);
+        assert_eq!(reg.signature(), &[0xEE; SIGNATURE_SIZE]);
     }
 
     #[test]
     fn complex_view_utxo_round_trip() {
-        let mut tx_bytes = [0u8; 127];
+        const LEN: usize = TX_HEADER_SIZE + 2 + UTXO_INPUT_SIZE + UTXO_OUTPUT_SIZE;
+        const OUT: usize = TX_HEADER_SIZE + 2 + UTXO_INPUT_SIZE;
+        let mut tx_bytes = [0u8; LEN];
         tx_bytes[0] = TX_TYPE_COMPLEX;
         tx_bytes[1..5].copy_from_slice(&77u32.to_le_bytes());
         tx_bytes[5] = 1;
@@ -1152,10 +1173,10 @@ mod tests {
         tx_bytes[8..12].copy_from_slice(&0x0102_0304u32.to_le_bytes());
         tx_bytes[12..14].copy_from_slice(&3u16.to_le_bytes());
         tx_bytes[14..22].copy_from_slice(&5000u64.to_le_bytes());
-        tx_bytes[22..86].fill(0xCD);
-        tx_bytes[86] = OUTPUT_TYPE_UTXO;
-        tx_bytes[87..119].fill(0xEF);
-        tx_bytes[119..127].copy_from_slice(&5000u64.to_le_bytes());
+        tx_bytes[22..OUT].fill(0xCD);
+        tx_bytes[OUT] = OUTPUT_TYPE_UTXO;
+        tx_bytes[OUT + 1..OUT + 1 + PUBLIC_KEY_SIZE].fill(0xEF);
+        tx_bytes[OUT + 1 + PUBLIC_KEY_SIZE..].copy_from_slice(&5000u64.to_le_bytes());
 
         let block = build_tx_block(&[&tx_bytes[..]]);
         let tx = block.transactions().unwrap().iter().next().unwrap();
@@ -1171,18 +1192,18 @@ mod tests {
         assert_eq!(utxo_in.block_sequence(), 0x0102_0304);
         assert_eq!(utxo_in.output_index(), 3);
         assert_eq!(utxo_in.amount(), 5000);
-        assert_eq!(utxo_in.signature(), &[0xCD; 64]);
+        assert_eq!(utxo_in.signature(), &[0xCD; SIGNATURE_SIZE]);
 
         let out = cx.outputs().next().unwrap();
         assert_eq!(out.output_type(), 0);
         let utxo_out = out.as_utxo().unwrap();
-        assert_eq!(utxo_out.address(), &[0xEF; 32]);
+        assert_eq!(utxo_out.address(), &[0xEF; PUBLIC_KEY_SIZE]);
         assert_eq!(utxo_out.amount(), 5000);
     }
 
     #[test]
     fn complex_view_balance_io() {
-        let mut tx_bytes = [0u8; 109];
+        let mut tx_bytes = [0u8; TX_HEADER_SIZE + 2 + BALANCE_INPUT_SIZE + BALANCE_OUTPUT_SIZE];
         tx_bytes[0] = TX_TYPE_COMPLEX;
         tx_bytes[1..5].copy_from_slice(&0u32.to_le_bytes());
         tx_bytes[5] = 1;
@@ -1198,8 +1219,8 @@ mod tests {
         pos += 8;
         tx_bytes[pos..pos + 8].copy_from_slice(&99u64.to_le_bytes());
         pos += 8;
-        tx_bytes[pos..pos + 64].fill(0x11);
-        pos += 64;
+        tx_bytes[pos..pos + SIGNATURE_SIZE].fill(0x11);
+        pos += SIGNATURE_SIZE;
         tx_bytes[pos] = OUTPUT_TYPE_BALANCE;
         pos += 1;
         tx_bytes[pos..pos + 4].copy_from_slice(&8u32.to_le_bytes());
@@ -1216,7 +1237,7 @@ mod tests {
         assert_eq!(bi.initializer(), 7);
         assert_eq!(bi.amount(), 3000);
         assert_eq!(bi.comment(), 99);
-        assert_eq!(bi.signature().len(), 64);
+        assert_eq!(bi.signature().len(), SIGNATURE_SIZE);
 
         let out = cx.outputs().next().unwrap();
         let bo = out.as_balance().unwrap();
@@ -1228,7 +1249,7 @@ mod tests {
 
     #[test]
     fn node_transfer_builder_round_trip() {
-        let sig = [0xAA; 64];
+        let sig = [0xAA; SIGNATURE_SIZE];
         let nt = NodeTransfer::new(99, 10, 1, 2, 1000, 5, 42, &sig);
         let bytes = nt.as_bytes();
         assert_eq!(bytes.len(), NODE_TRANSFER_SIZE);
@@ -1243,14 +1264,14 @@ mod tests {
         assert_eq!(nv.amount(), 1000);
         assert_eq!(nv.fee(), 5);
         assert_eq!(nv.comment(), 42);
-        assert_eq!(nv.signature(), &[0xAA; 64]);
+        assert_eq!(nv.signature(), &[0xAA; SIGNATURE_SIZE]);
     }
 
     #[test]
     fn registration_builder_round_trip() {
-        let pub_key = [0xCC; 32];
-        let key_sig = [0xDD; 64];
-        let sig = [0xEE; 64];
+        let pub_key = [0xCC; PUBLIC_KEY_SIZE];
+        let key_sig = [0xDD; SIGNATURE_SIZE];
+        let sig = [0xEE; SIGNATURE_SIZE];
         let reg = Registration::new(50, 1, 42, 1000, 10, &pub_key, &key_sig, &sig);
         let bytes = reg.as_bytes();
         assert_eq!(bytes.len(), REGISTRATION_SIZE);
@@ -1263,16 +1284,16 @@ mod tests {
         assert_eq!(rv.new_node_id(), 42);
         assert_eq!(rv.registration_price(), 1000);
         assert_eq!(rv.fee(), 10);
-        assert_eq!(rv.new_public_key(), &[0xCC; 32]);
-        assert_eq!(rv.new_key_signature(), &[0xDD; 64]);
-        assert_eq!(rv.signature(), &[0xEE; 64]);
+        assert_eq!(rv.new_public_key(), &[0xCC; PUBLIC_KEY_SIZE]);
+        assert_eq!(rv.new_key_signature(), &[0xDD; SIGNATURE_SIZE]);
+        assert_eq!(rv.signature(), &[0xEE; SIGNATURE_SIZE]);
     }
 
     #[test]
     fn complex_builder_utxo_round_trip() {
         let mut cx = ComplexTransaction::new(77);
-        let in_sig = [0xCD; 64];
-        let address = [0xEF; 32];
+        let in_sig = [0xCD; SIGNATURE_SIZE];
+        let address = [0xEF; PUBLIC_KEY_SIZE];
         cx.add_utxo_input(41, 3, 5000, &in_sig).unwrap();
         cx.add_utxo_output(&address, 5000).unwrap();
 
@@ -1290,18 +1311,18 @@ mod tests {
         assert_eq!(ui.block_sequence(), 41);
         assert_eq!(ui.output_index(), 3);
         assert_eq!(ui.amount(), 5000);
-        assert_eq!(ui.signature(), &[0xCD; 64]);
+        assert_eq!(ui.signature(), &[0xCD; SIGNATURE_SIZE]);
 
         let out = cv.outputs().next().unwrap();
         let uo = out.as_utxo().unwrap();
-        assert_eq!(uo.address(), &[0xEF; 32]);
+        assert_eq!(uo.address(), &[0xEF; PUBLIC_KEY_SIZE]);
         assert_eq!(uo.amount(), 5000);
     }
 
     #[test]
     fn complex_builder_balance_io() {
         let mut cx = ComplexTransaction::new(0);
-        let sig = [0x11; 64];
+        let sig = [0x11; SIGNATURE_SIZE];
         cx.add_balance_input(100, 7, 3000, 99, &sig).unwrap();
         cx.add_balance_output(8, 2500).unwrap();
 
@@ -1323,32 +1344,59 @@ mod tests {
     #[test]
     fn complex_builder_rejects_input_after_output() {
         let mut cx = ComplexTransaction::new(0);
-        let address = [0; 32];
+        let address = [0; PUBLIC_KEY_SIZE];
         cx.add_utxo_output(&address, 100).unwrap();
 
-        let sig = [0; 64];
+        let sig = [0; SIGNATURE_SIZE];
         let result = cx.add_utxo_input(0, 0, 0, &sig);
         assert!(matches!(result, Err(BlockError::MalformedBlock(_))));
     }
 
+    #[test]
+    fn wire_sizes_match_the_story_6_17_table_for_the_built_scheme() {
+        // Written down independently of the formulas (Story 6.17 AC1, DEC-251), so a
+        // formula error that shows under one scheme only cannot pass: header, node
+        // transfer, registration, UTXO input, balance input, UTXO output, node info.
+        #[cfg(feature = "schnorr")]
+        const EXPECTED: [usize; 7] = [122, 101, 189, 79, 89, 41, 48];
+        #[cfg(feature = "bls-min-sig")]
+        const EXPECTED: [usize; 7] = [106, 85, 221, 63, 73, 105, 112];
+        #[cfg(feature = "bls-min-pk")]
+        const EXPECTED: [usize; 7] = [154, 133, 269, 111, 121, 57, 64];
+        assert_eq!(
+            [
+                crate::HEADER_SIZE,
+                NODE_TRANSFER_SIZE,
+                REGISTRATION_SIZE,
+                UTXO_INPUT_SIZE,
+                BALANCE_INPUT_SIZE,
+                UTXO_OUTPUT_SIZE,
+                crate::NODE_INFO_SIZE,
+            ],
+            EXPECTED
+        );
+    }
+
     /// ADR-016 / DEC-131 / DEC-222 wire format: the entry is `type ‖
     /// block_sequence u32 LE ‖ output_index u16 LE ‖ amount u64 LE ‖
-    /// signature`, 79 bytes with the type byte.
+    /// signature`, 15 bytes plus the signature with the type byte (79 under Schnorr).
     #[test]
-    fn utxo_input_entry_is_79_bytes_with_le_sequence_index_and_amount() {
+    fn utxo_input_entry_is_15_bytes_plus_the_signature_with_le_sequence_index_and_amount() {
         let mut cx = ComplexTransaction::new(0);
-        let sig = [0x77; 64];
+        let sig = [0x77; SIGNATURE_SIZE];
         cx.add_utxo_input(0xA1B2_C3D4, 0x0309, 0x0102_0304_0506_0708, &sig)
             .unwrap();
 
         let bytes = cx.as_bytes();
         let entry = &bytes[TX_HEADER_SIZE + 2..];
+        assert_eq!(entry.len(), 15 + SIGNATURE_SIZE);
+        #[cfg(feature = "schnorr")]
         assert_eq!(entry.len(), 79);
         assert_eq!(entry[0], INPUT_TYPE_UTXO);
         assert_eq!(&entry[1..5], &[0xD4, 0xC3, 0xB2, 0xA1]);
         assert_eq!(&entry[5..7], &[0x09, 0x03]);
         assert_eq!(&entry[7..15], &[8, 7, 6, 5, 4, 3, 2, 1]);
-        assert_eq!(&entry[15..79], &sig);
+        assert_eq!(&entry[15..], &sig);
 
         // An index above `u8` round-trips; the bitfield refuses it later.
         let view = TransactionView { data: bytes };
@@ -1362,12 +1410,12 @@ mod tests {
     fn the_256th_input_and_output_are_refused() {
         let mut cx = ComplexTransaction::new(0);
         cx.data[5] = u8::MAX;
-        let input = cx.add_balance_input(1, 1, 1, 0, &[0; 64]);
+        let input = cx.add_balance_input(1, 1, 1, 0, &[0; SIGNATURE_SIZE]);
         assert!(matches!(
             input,
             Err(BlockError::MalformedBlock("too many inputs"))
         ));
-        let utxo = cx.add_utxo_input(1, 0, 1, &[0; 64]);
+        let utxo = cx.add_utxo_input(1, 0, 1, &[0; SIGNATURE_SIZE]);
         assert!(matches!(
             utxo,
             Err(BlockError::MalformedBlock("too many inputs"))
@@ -1386,7 +1434,7 @@ mod tests {
             output,
             Err(BlockError::MalformedBlock("too many outputs"))
         ));
-        let utxo = cx.add_utxo_output(&[0; 32], 1);
+        let utxo = cx.add_utxo_output(&[0; PUBLIC_KEY_SIZE], 1);
         assert!(matches!(
             utxo,
             Err(BlockError::MalformedBlock("too many outputs"))
@@ -1404,11 +1452,11 @@ mod tests {
     #[test]
     fn complex_mixed_input_types() {
         let mut cx = ComplexTransaction::new(10);
-        let utxo_sig = [0xCD; 64];
-        let bal_sig = [0x11; 64];
+        let utxo_sig = [0xCD; SIGNATURE_SIZE];
+        let bal_sig = [0x11; SIGNATURE_SIZE];
         cx.add_utxo_input(9, 0, 800, &utxo_sig).unwrap();
         cx.add_balance_input(50, 3, 1000, 7, &bal_sig).unwrap();
-        cx.add_utxo_output(&[0xEF; 32], 800).unwrap();
+        cx.add_utxo_output(&[0xEF; PUBLIC_KEY_SIZE], 800).unwrap();
         cx.add_balance_output(5, 200).unwrap();
 
         let bytes = cx.as_bytes();
@@ -1439,13 +1487,13 @@ mod tests {
     #[test]
     fn complex_multiple_inputs_and_outputs() {
         let mut cx = ComplexTransaction::new(0);
-        let sig1 = [0xAA; 64];
-        let sig2 = [0xBB; 64];
+        let sig1 = [0xAA; SIGNATURE_SIZE];
+        let sig2 = [0xBB; SIGNATURE_SIZE];
         cx.add_utxo_input(1, 0, 600, &sig1).unwrap();
         cx.add_utxo_input(2, 1, 400, &sig2).unwrap();
         cx.add_balance_output(1, 500).unwrap();
         cx.add_balance_output(2, 300).unwrap();
-        cx.add_utxo_output(&[0xCC; 32], 200).unwrap();
+        cx.add_utxo_output(&[0xCC; PUBLIC_KEY_SIZE], 200).unwrap();
 
         let bytes = cx.as_bytes();
         let view = TransactionView { data: bytes };

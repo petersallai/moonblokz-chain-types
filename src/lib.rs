@@ -12,12 +12,6 @@ compile_error!(
     "moonblokz-chain-types requires one signature-scheme feature: keep the default `schnorr`, or choose `bls-min-sig` / `bls-min-pk` with `default-features = false`"
 );
 
-// The wire layouts below are Schnorr-sized; BLS on the chain is Story 6.17.
-#[cfg(any(feature = "bls-min-sig", feature = "bls-min-pk"))]
-compile_error!(
-    "moonblokz-chain-types: BLS on the chain is Story 6.17; the wire layouts are Schnorr-sized until then"
-);
-
 // Exactly one block-size tier: the build's block capacity (DEC-220). It is a
 // property of the whole binary, so every crate above forwards the same feature.
 #[cfg(not(any(feature = "block-size-2016", feature = "block-size-65536")))]
@@ -37,12 +31,15 @@ pub mod error;
 pub mod hash;
 pub mod transaction;
 
-// Current chain wire types are Schnorr-shaped: 64-byte signatures and
-// 32-byte public keys. If a future crypto backend changes these dimensions,
-// the wire layout must be changed deliberately instead of silently truncating
-// or padding serialized crypto artifacts.
-const _: () = assert!(moonblokz_crypto::SIGNATURE_SIZE == 64);
-const _: () = assert!(moonblokz_crypto::PUBLIC_KEY_SIZE == 32);
+// The wire layouts are derived from the scheme's sizes (DEC-251): every signature- and
+// key-sized field, and every offset after one, is computed from these constants. A
+// support or evidence contribution is a `MultiSignature`, the same size as a signature
+// in every scheme, which the layouts rely on.
+const _: () = assert!(moonblokz_crypto::MULTI_SIGNATURE_SIZE == moonblokz_crypto::SIGNATURE_SIZE);
+
+/// The scheme's wire sizes, re-exported for crates that frame chain data without a
+/// crypto dependency of their own (DEC-251).
+pub use moonblokz_crypto::{PUBLIC_KEY_SIZE, SIGNATURE_SIZE};
 
 pub use balance::{
     BalanceBlockPayloadView, BalanceIterator, NODE_INFO_SIZE, NodeInfo, NodeInfoView,
