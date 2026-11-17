@@ -33,7 +33,7 @@ use crate::hash::{HASH_SIZE, calculate_hash};
 use crate::transaction::{
     ComplexTransaction, NodeTransfer, Registration, TransactionBlockPayloadView,
 };
-use moonblokz_crypto::{CryptoTrait, SignatureTrait};
+use moonblokz_crypto::{CryptoTrait, SIGNATURE_SIZE, SignatureTrait};
 
 /// This build's block capacity in bytes: the largest encoded block it can
 /// frame, hold and store.
@@ -53,8 +53,9 @@ pub const MAX_BLOCK_SIZE: usize = 65536;
 // DEC-227), so a tier above it could not be stated.
 const _: () = assert!(MAX_BLOCK_SIZE <= u32::MAX as usize);
 
-/// Fixed header size in bytes for the current MoonBlokz block format.
-pub const HEADER_SIZE: usize = 122;
+/// Header size in bytes: 58 fixed bytes, then the block signature, whose size is the
+/// build's scheme's (DEC-251): 122 (`schnorr`), 106 (`bls-min-sig`), 154 (`bls-min-pk`).
+pub const HEADER_SIZE: usize = SIGNATURE_OFFSET + SIGNATURE_SIZE;
 
 const VERSION_OFFSET: usize = 0;
 const SEQUENCE_OFFSET: usize = 1;
@@ -72,7 +73,7 @@ const PAYLOAD_OFFSET: usize = HEADER_SIZE;
 // `from_bytes` has guaranteed `bytes.len() >= HEADER_SIZE`. Reordering the
 // offset constants without rechecking the asserts will fail to compile.
 const _: () = assert!(VERSION_OFFSET < HEADER_SIZE);
-const _: () = assert!(SIGNATURE_OFFSET + 64 == HEADER_SIZE);
+const _: () = assert!(SIGNATURE_OFFSET + SIGNATURE_SIZE == HEADER_SIZE);
 const _: () = assert!(PREVIOUS_HASH_OFFSET + 32 == SIGNATURE_OFFSET);
 const _: () = assert!(PAYLOAD_OFFSET == HEADER_SIZE);
 
@@ -115,7 +116,7 @@ pub struct BlockHeader {
     /// Previous block hash.
     pub previous_hash: [u8; 32],
     /// Block signature.
-    pub signature: [u8; 64],
+    pub signature: [u8; SIGNATURE_SIZE],
 }
 
 /// Borrowed zero-copy view onto a serialized block.
@@ -245,7 +246,7 @@ impl<'a> BlockView<'a> {
 
     /// Block signature (64 bytes, borrowed).
     pub fn signature(&self) -> &'a [u8] {
-        &self.bytes[SIGNATURE_OFFSET..SIGNATURE_OFFSET + 64]
+        &self.bytes[SIGNATURE_OFFSET..HEADER_SIZE]
     }
 
     /// Returns the payload slice.
@@ -285,8 +286,9 @@ impl<'a> BlockView<'a> {
         let payload_len = match self.payload_type() {
             PAYLOAD_TYPE_TRANSACTION => crate::transaction::payload_content_len(payload)?,
             PAYLOAD_TYPE_BALANCE => crate::balance::payload_content_len(payload)?,
-            PAYLOAD_TYPE_CHAIN_CONFIG => crate::chain_config::content_end(payload)?
-                .checked_add(moonblokz_crypto::SIGNATURE_SIZE)?,
+            PAYLOAD_TYPE_CHAIN_CONFIG => {
+                crate::chain_config::content_end(payload)?.checked_add(SIGNATURE_SIZE)?
+            }
             // FR12/FR27 — Epic 6 must extend this arm when the approval payload
             // gains a format. Answering `HEADER_SIZE` for a non-empty payload
             // would be a guess, and a wrong block hash is worse than a refusal.
@@ -428,7 +430,7 @@ impl Block {
     ///     first_voted_node: 0,
     ///     consumed_votes_from_first_voted_node: 0,
     ///     previous_hash: [0; 32],
-    ///     signature: [0; 64],
+    ///     signature: [0; moonblokz_crypto::SIGNATURE_SIZE],
     /// };
     ///
     /// let block = match BlockBuilder::new().header(header).build_signed(&crypto) {
@@ -592,7 +594,7 @@ impl BlockBuilder {
                 first_voted_node: 0,
                 consumed_votes_from_first_voted_node: 0,
                 previous_hash: [0; 32],
-                signature: [0; 64],
+                signature: [0; SIGNATURE_SIZE],
             },
             payload: [0u8; MAX_PAYLOAD_SIZE],
             payload_len: 0,
@@ -620,7 +622,7 @@ impl BlockBuilder {
     ///     first_voted_node: 0,
     ///     consumed_votes_from_first_voted_node: 0,
     ///     previous_hash: [0; 32],
-    ///     signature: [0; 64],
+    ///     signature: [0; moonblokz_crypto::SIGNATURE_SIZE],
     /// };
     /// let _builder = BlockBuilder::new().header(header);
     /// ```
@@ -809,7 +811,7 @@ impl BlockBuilder {
     ///     first_voted_node: 0,
     ///     consumed_votes_from_first_voted_node: 0,
     ///     previous_hash: [0; 32],
-    ///     signature: [0; 64],
+    ///     signature: [0; moonblokz_crypto::SIGNATURE_SIZE],
     /// };
     ///
     /// let block_result = BlockBuilder::new().header(header).build_signed(&crypto);
@@ -860,7 +862,7 @@ impl BlockBuilder {
         // The signature signs the full canonical block with this field
         // zero-filled. This avoids a self-referential signature while still
         // including the payload bytes in the signed content.
-        data[SIGNATURE_OFFSET..SIGNATURE_OFFSET + 64].copy_from_slice(&[0u8; 64]);
+        data[SIGNATURE_OFFSET..HEADER_SIZE].copy_from_slice(&[0u8; SIGNATURE_SIZE]);
 
         if self.payload_len > 0 {
             data[PAYLOAD_OFFSET..PAYLOAD_OFFSET + self.payload_len]
@@ -868,7 +870,7 @@ impl BlockBuilder {
         }
 
         let signature = crypto.sign(&data[..len]);
-        data[SIGNATURE_OFFSET..SIGNATURE_OFFSET + 64].copy_from_slice(signature.serialize());
+        data[SIGNATURE_OFFSET..HEADER_SIZE].copy_from_slice(signature.serialize());
 
         Ok(Block { data, len })
     }
@@ -906,6 +908,7 @@ pub(crate) fn read_u64_le(data: &[u8], offset: usize) -> u64 {
 mod tests {
     use super::*;
     use moonblokz_crypto::{Crypto, CryptoTrait, PRIVATE_KEY_SIZE};
+    use moonblokz_crypto::{PUBLIC_KEY_SIZE, SIGNATURE_SIZE};
 
     fn test_crypto() -> Crypto {
         // `CryptoError` has no `Debug` even under test, so `.expect()` cannot be
@@ -931,7 +934,7 @@ mod tests {
             first_voted_node: 19,
             consumed_votes_from_first_voted_node: 17,
             previous_hash: [9u8; 32],
-            signature: [5u8; 64],
+            signature: [5u8; SIGNATURE_SIZE],
         }
     }
 
@@ -1002,7 +1005,7 @@ mod tests {
         (bytes, signed.len())
     }
 
-    fn transaction_block_with_signature(tx_signature: &[u8; 64]) -> Block {
+    fn transaction_block_with_signature(tx_signature: &[u8; SIGNATURE_SIZE]) -> Block {
         let nt = NodeTransfer::new(99, 10, 1, 2, 1000, 5, 42, tx_signature);
         let mut builder = BlockBuilder::new().header(BlockHeader {
             payload_type: 0,
@@ -1014,12 +1017,12 @@ mod tests {
 
     #[test]
     fn content_length_recovers_a_transaction_block() {
-        assert_recovers(&transaction_block_with_signature(&[0xAA; 64]));
+        assert_recovers(&transaction_block_with_signature(&[0xAA; SIGNATURE_SIZE]));
     }
 
     #[test]
     fn content_length_recovers_a_balance_block() {
-        let ni = NodeInfo::new(3, 5000, 12, &[7u8; 32]);
+        let ni = NodeInfo::new(3, 5000, 12, &[7u8; PUBLIC_KEY_SIZE]);
         let mut builder = BlockBuilder::new().header(BlockHeader {
             payload_type: 0,
             ..sample_header()
@@ -1046,21 +1049,30 @@ mod tests {
         assert_eq!(view.content_length(), None);
     }
 
-    /// The 8-byte balance prefix still fits 39 entries per reference block.
+    /// The 8-byte balance prefix leaves room for 39 / 16 / 28 entries per reference block
+    /// (Schnorr / min-sig / min-pk, DEC-251); one more is refused.
     #[cfg(feature = "block-size-2016")]
     #[test]
-    fn a_reference_balance_block_holds_39_entries() {
+    fn a_reference_balance_block_holds_the_entries_its_payload_fits() {
+        let fit = (MAX_PAYLOAD_SIZE - 8) / crate::NODE_INFO_SIZE;
+        #[cfg(feature = "schnorr")]
+        assert_eq!(fit, 39);
+        #[cfg(feature = "bls-min-sig")]
+        assert_eq!(fit, 16);
+        #[cfg(feature = "bls-min-pk")]
+        assert_eq!(fit, 28);
         let mut builder = BlockBuilder::new().header(BlockHeader {
             payload_type: 0,
             ..sample_header()
         });
-        for owner in 0..39 {
+        for owner in 0..fit as u32 {
             builder
-                .add_node_info(&NodeInfo::new(owner, 1, 0, &[1u8; 32]))
+                .add_node_info(&NodeInfo::new(owner, 1, 0, &[1u8; PUBLIC_KEY_SIZE]))
                 .unwrap();
         }
-        let fortieth = builder.add_node_info(&NodeInfo::new(39, 1, 0, &[1u8; 32]));
-        assert!(matches!(fortieth, Err(BlockError::PayloadTooLarge { .. })));
+        let one_more =
+            builder.add_node_info(&NodeInfo::new(fit as u32, 1, 0, &[1u8; PUBLIC_KEY_SIZE]));
+        assert!(matches!(one_more, Err(BlockError::PayloadTooLarge { .. })));
     }
 
     /// DEC-222: a transaction payload's count stays a `u16`, a protocol bound of
@@ -1109,11 +1121,11 @@ mod tests {
 
     #[test]
     fn content_length_recovers_a_complex_transaction_with_mixed_item_types() {
-        let sig = [0x5A; 64];
+        let sig = [0x5A; SIGNATURE_SIZE];
         let mut cx = ComplexTransaction::new(4);
         cx.add_utxo_input(1, 2, 400, &sig).unwrap();
         cx.add_balance_input(7, 3, 900, 0, &sig).unwrap();
-        cx.add_utxo_output(&[2u8; 32], 400).unwrap();
+        cx.add_utxo_output(&[2u8; PUBLIC_KEY_SIZE], 400).unwrap();
         cx.add_balance_output(5, 500).unwrap();
 
         let mut builder = BlockBuilder::new().header(BlockHeader {
@@ -1123,9 +1135,11 @@ mod tests {
         builder.add_complex_transaction(&cx).unwrap();
         let block = builder.build_signed(&test_crypto()).unwrap();
 
-        // 5 (tx header) + 2 (counts) + 79 + 89 + 41 + 13 = 229, + the 2-byte
-        // payload transaction count, + the block header.
-        assert_eq!(block.len(), HEADER_SIZE + 2 + 229);
+        // 5 (tx header) + 2 (counts) + UTXO input (15 + SIG) + balance input (25 + SIG) +
+        // UTXO output (9 + PK) + balance output 13 = 69 + 2 SIG + PK (229 under Schnorr),
+        // + the 2-byte payload transaction count, + the block header.
+        let tx_len = 69 + 2 * SIGNATURE_SIZE + PUBLIC_KEY_SIZE;
+        assert_eq!(block.len(), HEADER_SIZE + 2 + tx_len);
         assert_recovers(&block);
     }
 
@@ -1134,8 +1148,8 @@ mod tests {
     /// legitimate block and compute a wrong hash.
     #[test]
     fn content_length_is_not_fooled_by_content_ending_in_zero() {
-        let mut tx_signature = [0xAA; 64];
-        tx_signature[63] = 0;
+        let mut tx_signature = [0xAA; SIGNATURE_SIZE];
+        tx_signature[SIGNATURE_SIZE - 1] = 0;
         let block = transaction_block_with_signature(&tx_signature);
         assert_eq!(*block.serialized_bytes().last().unwrap(), 0);
         assert_recovers(&block);
@@ -1269,14 +1283,14 @@ mod tests {
     /// whole point is that they stop agreeing once storage pads it.
     #[test]
     fn content_length_equals_len_for_exact_wire_bytes() {
-        let block = transaction_block_with_signature(&[0xAA; 64]);
+        let block = transaction_block_with_signature(&[0xAA; SIGNATURE_SIZE]);
         let parsed = Block::from_bytes(block.serialized_bytes()).expect("parses");
         assert_eq!(parsed.content_length(), Some(parsed.len()));
     }
 
     #[test]
     fn builder_round_trip_from_bytes() {
-        let sig = [0xAA; 64];
+        let sig = [0xAA; SIGNATURE_SIZE];
         let nt = NodeTransfer::new(99, 10, 1, 2, 1000, 5, 42, &sig);
         let mut builder = BlockBuilder::new().header(BlockHeader {
             payload_type: 0,
@@ -1338,8 +1352,8 @@ mod tests {
     fn accessors_return_expected_values() {
         let mut prev = [0u8; 32];
         prev[0] = 99;
-        let mut sig = [0u8; 64];
-        sig[63] = 88;
+        let mut sig = [0u8; SIGNATURE_SIZE];
+        sig[SIGNATURE_SIZE - 1] = 88;
 
         let header = BlockHeader {
             previous_hash: prev,
@@ -1396,7 +1410,7 @@ mod tests {
             first_voted_node: 0,
             consumed_votes_from_first_voted_node: 0,
             previous_hash: [0x42; 32],
-            signature: [0u8; 64],
+            signature: [0u8; SIGNATURE_SIZE],
         };
         let config_bytes = [0xC0, 0xA5, 0xF6, 0x01, 0x02, 0x03];
         let mut builder = BlockBuilder::new().header(header);
@@ -1470,7 +1484,7 @@ mod tests {
             first_voted_node: 0x15141312,
             consumed_votes_from_first_voted_node: 0x19181716,
             previous_hash: [0xAA; 32],
-            signature: [0xBB; 64],
+            signature: [0xBB; SIGNATURE_SIZE],
         };
 
         let block = BlockBuilder::new()
@@ -1488,7 +1502,7 @@ mod tests {
         assert_eq!(&bytes[18..22], &[0x12, 0x13, 0x14, 0x15]); // first_voted_node LE
         assert_eq!(&bytes[22..26], &[0x16, 0x17, 0x18, 0x19]); // consumed_votes_from_first LE
         assert_eq!(&bytes[26..58], &[0xAA; 32]); // previous_hash
-        assert!(any_nonzero(&bytes[58..122])); // signature supplied by crypto
+        assert!(any_nonzero(&bytes[58..HEADER_SIZE])); // signature supplied by crypto
         assert_eq!(bytes.len(), HEADER_SIZE);
     }
 
@@ -1496,7 +1510,7 @@ mod tests {
 
     #[test]
     fn block_builder_add_node_transfer() {
-        let sig = [0xAA; 64];
+        let sig = [0xAA; SIGNATURE_SIZE];
         let nt = NodeTransfer::new(99, 10, 1, 2, 1000, 5, 42, &sig);
         let mut builder = BlockBuilder::new().header(BlockHeader {
             payload_type: 0,
@@ -1515,7 +1529,7 @@ mod tests {
 
     #[test]
     fn block_builder_add_two_node_transfers() {
-        let sig = [0xAA; 64];
+        let sig = [0xAA; SIGNATURE_SIZE];
         let nt1 = NodeTransfer::new(1, 10, 1, 2, 100, 1, 0, &sig);
         let nt2 = NodeTransfer::new(2, 20, 3, 4, 200, 2, 1, &sig);
         let mut builder = BlockBuilder::new().header(BlockHeader {
@@ -1541,7 +1555,7 @@ mod tests {
 
     #[test]
     fn block_builder_add_transaction_bytes() {
-        let sig = [0xAA; 64];
+        let sig = [0xAA; SIGNATURE_SIZE];
         let nt = NodeTransfer::new(99, 10, 1, 2, 1000, 5, 42, &sig);
         let mut builder = BlockBuilder::new().header(BlockHeader {
             payload_type: 0,
@@ -1558,7 +1572,7 @@ mod tests {
 
     #[test]
     fn block_builder_add_node_info() {
-        let pub_key = [0xBB; 32];
+        let pub_key = [0xBB; PUBLIC_KEY_SIZE];
         let ni = NodeInfo::new(5, 2000, 3, &pub_key);
         let mut builder = BlockBuilder::new().header(BlockHeader {
             payload_type: 0,
@@ -1577,7 +1591,7 @@ mod tests {
 
     #[test]
     fn block_builder_set_max_node_id() {
-        let pub_key = [0; 32];
+        let pub_key = [0; PUBLIC_KEY_SIZE];
         let ni = NodeInfo::new(3, 100, 0, &pub_key);
         let mut builder = BlockBuilder::new().header(BlockHeader {
             payload_type: 0,
@@ -1592,9 +1606,9 @@ mod tests {
 
     #[test]
     fn block_builder_rejects_type_mismatch() {
-        let sig = [0xAA; 64];
+        let sig = [0xAA; SIGNATURE_SIZE];
         let nt = NodeTransfer::new(0, 0, 0, 0, 0, 0, 0, &sig);
-        let pub_key = [0; 32];
+        let pub_key = [0; PUBLIC_KEY_SIZE];
         let ni = NodeInfo::new(0, 0, 0, &pub_key);
         let mut builder = BlockBuilder::new().header(BlockHeader {
             payload_type: 0,
@@ -1620,7 +1634,7 @@ mod tests {
 
     #[test]
     fn set_max_node_id_lower_than_auto_tracked() {
-        let pub_key = [0; 32];
+        let pub_key = [0; PUBLIC_KEY_SIZE];
         let ni = NodeInfo::new(100, 500, 0, &pub_key);
         let mut builder = BlockBuilder::new().header(BlockHeader {
             payload_type: 0,
@@ -1635,7 +1649,7 @@ mod tests {
 
     #[test]
     fn add_methods_reject_at_max_payload() {
-        let sig = [0xAA; 64];
+        let sig = [0xAA; SIGNATURE_SIZE];
         let nt = NodeTransfer::new(0, 0, 0, 0, 0, 0, 0, &sig);
         let mut builder = BlockBuilder::new().header(BlockHeader {
             payload_type: 0,
@@ -1670,7 +1684,7 @@ mod tests {
         // field values to the originating builder header.
         let header = BlockHeader {
             previous_hash: [0x11; 32],
-            signature: [0x22; 64],
+            signature: [0x22; SIGNATURE_SIZE],
             ..sample_header()
         };
         let block = BlockBuilder::new()
@@ -1729,7 +1743,7 @@ mod tests {
         // AC2 + AC4: An owned Block exposes a zero-copy view via `view()`; the
         // view's accessors return identical values to the owned block's
         // accessors, and the borrowed bytes point inside the owned buffer.
-        let sig = [0xAA; 64];
+        let sig = [0xAA; SIGNATURE_SIZE];
         let nt = NodeTransfer::new(99, 10, 1, 2, 1000, 5, 42, &sig);
         let mut builder = BlockBuilder::new().header(BlockHeader {
             payload_type: 0,

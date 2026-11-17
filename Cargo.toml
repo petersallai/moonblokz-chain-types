@@ -11,8 +11,8 @@ categories = ["embedded", "no-std"]
 
 [features]
 # Exactly one signature scheme must be enabled (DEC-246): `schnorr` (default),
-# `bls-min-sig` or `bls-min-pk`. The chain's wire layouts are Schnorr-sized until
-# Story 6.17, so the BLS schemes are refused at compile time for now.
+# `bls-min-sig` or `bls-min-pk`. The wire layouts are derived from the scheme's
+# sizes (DEC-251).
 default = ["schnorr", "block-size-2016"]
 schnorr = ["moonblokz-crypto/schnorr"]
 bls-min-sig = ["moonblokz-crypto/bls-min-sig"]
@@ -27,3 +27,28 @@ block-size-65536 = []
 [dependencies]
 moonblokz-crypto = { path = "../moonblokz-crypto-lib", default-features = false }
 sha2 = { version = "0.11", default-features = false }
+
+# Debug test runs build the curve code optimized (DEC-255): a BLS pairing in an
+# unoptimized build is very slow. Only takes effect when this crate is the Cargo root.
+[profile.dev.package.moonblokz-crypto]
+opt-level = 3
+[profile.dev.package.k256]
+opt-level = 3
+[profile.dev.package.primeorder]
+opt-level = 3
+[profile.dev.package.elliptic-curve]
+opt-level = 3
+[profile.dev.package.crypto-bigint]
+opt-level = 3
+[profile.dev.package.bls12_381]
+opt-level = 3
+[profile.dev.package.ff]
+opt-level = 3
+[profile.dev.package.group]
+opt-level = 3
+[profile.dev.package.pairing]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.subtle]
+opt-level = 3

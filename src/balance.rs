@@ -6,9 +6,11 @@ balance entries before adding them to a block.
 */
 
 use crate::block::{read_u32_le, read_u64_le};
+use moonblokz_crypto::PUBLIC_KEY_SIZE;
 
-/// Size of a single balance entry (node info) in bytes.
-pub const NODE_INFO_SIZE: usize = 48;
+/// Size of a single balance entry (node info) in bytes: owner u32 ‖ balance u64 ‖
+/// vote_count u32 ‖ public key (DEC-251): 48 / 112 / 64 per scheme.
+pub const NODE_INFO_SIZE: usize = 16 + PUBLIC_KEY_SIZE;
 
 /// Size of the balance payload header: nodeinfo_count(4) + max_node_id(4).
 ///
@@ -119,7 +121,7 @@ impl<'a> NodeInfoView<'a> {
         read_u32_le(self.data, 12)
     }
     pub fn public_key(&self) -> &[u8] {
-        &self.data[16..48]
+        &self.data[16..NODE_INFO_SIZE]
     }
 }
 
@@ -127,19 +129,24 @@ impl<'a> NodeInfoView<'a> {
 // Builder types
 // =======================================================================
 
-/// Owned node-info balance entry for block construction (48 bytes).
+/// Owned node-info balance entry for block construction (`NODE_INFO_SIZE` bytes).
 pub struct NodeInfo {
     data: [u8; NODE_INFO_SIZE],
 }
 
 impl NodeInfo {
     /// Creates a node-info entry with all required fields.
-    pub fn new(owner: u32, balance: u64, vote_count: u32, public_key: &[u8; 32]) -> Self {
+    pub fn new(
+        owner: u32,
+        balance: u64,
+        vote_count: u32,
+        public_key: &[u8; PUBLIC_KEY_SIZE],
+    ) -> Self {
         let mut data = [0u8; NODE_INFO_SIZE];
         data[0..4].copy_from_slice(&owner.to_le_bytes());
         data[4..12].copy_from_slice(&balance.to_le_bytes());
         data[12..16].copy_from_slice(&vote_count.to_le_bytes());
-        data[16..48].copy_from_slice(public_key);
+        data[16..NODE_INFO_SIZE].copy_from_slice(public_key);
         Self { data }
     }
 
@@ -163,6 +170,7 @@ mod tests {
     use super::*;
     use crate::block::{BlockBuilder, BlockHeader};
     use moonblokz_crypto::{Crypto, CryptoTrait, PRIVATE_KEY_SIZE};
+    use moonblokz_crypto::{PUBLIC_KEY_SIZE, SIGNATURE_SIZE};
 
     fn test_crypto() -> Crypto {
         Crypto::new([1u8; PRIVATE_KEY_SIZE])
@@ -181,7 +189,7 @@ mod tests {
             first_voted_node: 0,
             consumed_votes_from_first_voted_node: 0,
             previous_hash: [0; 32],
-            signature: [0; 64],
+            signature: [0; SIGNATURE_SIZE],
         }
     }
 
@@ -189,7 +197,7 @@ mod tests {
 
     #[test]
     fn balance_view_round_trip() {
-        let pub_key = [0xBB; 32];
+        let pub_key = [0xBB; PUBLIC_KEY_SIZE];
         let ni = NodeInfo::new(5, 2000, 3, &pub_key);
         let mut builder = BlockBuilder::new().header(sample_balance_header());
         builder.add_node_info(&ni).unwrap();
@@ -204,7 +212,7 @@ mod tests {
         assert_eq!(view.owner(), 5);
         assert_eq!(view.balance(), 2000);
         assert_eq!(view.vote_count(), 3);
-        assert_eq!(view.public_key(), &[0xBB; 32]);
+        assert_eq!(view.public_key(), &[0xBB; PUBLIC_KEY_SIZE]);
     }
 
     #[test]
@@ -222,7 +230,7 @@ mod tests {
 
     #[test]
     fn multiple_entries_iterate() {
-        let pub_key = [0xBB; 32];
+        let pub_key = [0xBB; PUBLIC_KEY_SIZE];
         let ni1 = NodeInfo::new(1, 100, 0, &pub_key);
         let ni2 = NodeInfo::new(2, 200, 1, &pub_key);
         let mut builder = BlockBuilder::new().header(sample_balance_header());
@@ -244,7 +252,7 @@ mod tests {
 
     #[test]
     fn node_info_builder_round_trip() {
-        let pub_key = [0xBB; 32];
+        let pub_key = [0xBB; PUBLIC_KEY_SIZE];
         let ni = NodeInfo::new(5, 2000, 3, &pub_key);
         assert_eq!(ni.as_bytes().len(), NODE_INFO_SIZE);
         assert_eq!(ni.owner(), 5);
@@ -255,7 +263,7 @@ mod tests {
         assert_eq!(view.owner(), 5);
         assert_eq!(view.balance(), 2000);
         assert_eq!(view.vote_count(), 3);
-        assert_eq!(view.public_key(), &[0xBB; 32]);
+        assert_eq!(view.public_key(), &[0xBB; PUBLIC_KEY_SIZE]);
     }
 
     #[test]
