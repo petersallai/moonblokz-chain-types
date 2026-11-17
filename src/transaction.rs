@@ -1352,9 +1352,6 @@ mod tests {
         assert!(matches!(result, Err(BlockError::MalformedBlock(_))));
     }
 
-    /// ADR-016 / DEC-131 / DEC-222 wire format: the entry is `type ‖
-    /// block_sequence u32 LE ‖ output_index u16 LE ‖ amount u64 LE ‖
-    /// signature`, 15 bytes plus the signature with the type byte (79 under Schnorr).
     #[test]
     fn wire_sizes_match_the_story_6_17_table_for_the_built_scheme() {
         // Written down independently of the formulas (Story 6.17 AC1, DEC-251), so a
@@ -1380,6 +1377,9 @@ mod tests {
         );
     }
 
+    /// ADR-016 / DEC-131 / DEC-222 wire format: the entry is `type ‖
+    /// block_sequence u32 LE ‖ output_index u16 LE ‖ amount u64 LE ‖
+    /// signature`, 15 bytes plus the signature with the type byte (79 under Schnorr).
     #[test]
     fn utxo_input_entry_is_15_bytes_plus_the_signature_with_le_sequence_index_and_amount() {
         let mut cx = ComplexTransaction::new(0);
