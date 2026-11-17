@@ -244,7 +244,7 @@ impl<'a> BlockView<'a> {
         &self.bytes[PREVIOUS_HASH_OFFSET..PREVIOUS_HASH_OFFSET + 32]
     }
 
-    /// Block signature (64 bytes, borrowed).
+    /// Block signature (`SIGNATURE_SIZE` bytes, borrowed).
     pub fn signature(&self) -> &'a [u8] {
         &self.bytes[SIGNATURE_OFFSET..HEADER_SIZE]
     }
@@ -512,7 +512,7 @@ impl Block {
         self.view().previous_hash()
     }
 
-    /// Block signature (64 bytes, borrowed).
+    /// Block signature (`SIGNATURE_SIZE` bytes, borrowed).
     pub fn signature(&self) -> &[u8] {
         self.view().signature()
     }
@@ -784,7 +784,7 @@ impl BlockBuilder {
     ///
     /// The signing input is the full canonical block byte sequence with the
     /// header signature field zero-filled. The returned owned [`Block`] stores
-    /// the signer-produced 64-byte signature in the header signature field.
+    /// the signer-produced signature in the header signature field.
     /// `BlockHeader::signature` is intentionally ignored: builders must finish
     /// through this method so callers cannot accidentally construct unsigned
     /// blocks.

@@ -105,7 +105,7 @@ impl<'a> Iterator for BalanceIterator<'a> {
     }
 }
 
-/// Zero-copy view of a single node-info balance entry (48 bytes).
+/// Zero-copy view of a single node-info balance entry (`NODE_INFO_SIZE` bytes).
 pub struct NodeInfoView<'a> {
     data: &'a [u8],
 }

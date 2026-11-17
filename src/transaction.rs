@@ -569,7 +569,7 @@ impl NodeTransfer {
     ///
     /// The signing input is the complete transaction byte sequence with the
     /// signature field zero-filled. The returned owned transaction stores the
-    /// signer-produced 64-byte signature in its signature field.
+    /// signer-produced signature (`SIGNATURE_SIZE` bytes) in its signature field.
     #[allow(clippy::too_many_arguments)]
     pub fn new_signed<Crypto: CryptoTrait>(
         vote: u32,
@@ -712,6 +712,11 @@ const _: () = assert!(BALANCE_INPUT_SIZE >= UTXO_INPUT_SIZE);
 const _: () = assert!(UTXO_OUTPUT_SIZE >= BALANCE_OUTPUT_SIZE);
 const _: () = assert!(NODE_TRANSFER_SIZE <= MAX_TRANSACTION_SIZE);
 const _: () = assert!(REGISTRATION_SIZE <= MAX_TRANSACTION_SIZE);
+// The builders' signature offsets and the body sizes are written independently;
+// the signature is the last field of both fixed-size transactions.
+const _: () = assert!(NODE_TRANSFER_SIGNATURE_OFFSET + SIGNATURE_SIZE == NODE_TRANSFER_SIZE);
+const _: () = assert!(REGISTRATION_SIGNATURE_OFFSET + SIGNATURE_SIZE == REGISTRATION_SIZE);
+const _: () = assert!(1 + UTXO_INPUT_SIGNATURE_OFFSET + SIGNATURE_SIZE == UTXO_INPUT_SIZE);
 
 /// Owned complex transaction builder for block construction.
 ///
@@ -1350,6 +1355,31 @@ mod tests {
     /// ADR-016 / DEC-131 / DEC-222 wire format: the entry is `type ‖
     /// block_sequence u32 LE ‖ output_index u16 LE ‖ amount u64 LE ‖
     /// signature`, 15 bytes plus the signature with the type byte (79 under Schnorr).
+    #[test]
+    fn wire_sizes_match_the_story_6_17_table_for_the_built_scheme() {
+        // Written down independently of the formulas (Story 6.17 AC1, DEC-251), so a
+        // formula error that shows under one scheme only cannot pass: header, node
+        // transfer, registration, UTXO input, balance input, UTXO output, node info.
+        #[cfg(feature = "schnorr")]
+        const EXPECTED: [usize; 7] = [122, 101, 189, 79, 89, 41, 48];
+        #[cfg(feature = "bls-min-sig")]
+        const EXPECTED: [usize; 7] = [106, 85, 221, 63, 73, 105, 112];
+        #[cfg(feature = "bls-min-pk")]
+        const EXPECTED: [usize; 7] = [154, 133, 269, 111, 121, 57, 64];
+        assert_eq!(
+            [
+                crate::HEADER_SIZE,
+                NODE_TRANSFER_SIZE,
+                REGISTRATION_SIZE,
+                UTXO_INPUT_SIZE,
+                BALANCE_INPUT_SIZE,
+                UTXO_OUTPUT_SIZE,
+                crate::NODE_INFO_SIZE,
+            ],
+            EXPECTED
+        );
+    }
+
     #[test]
     fn utxo_input_entry_is_15_bytes_plus_the_signature_with_le_sequence_index_and_amount() {
         let mut cx = ComplexTransaction::new(0);
