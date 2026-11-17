@@ -331,13 +331,20 @@ pub const APPROVAL_PREFIX_SIZE: usize = 13;
 /// Size of one approval late-node entry, `node_id u32 ‖ accumulated_vote u32`
 /// (DEC-184, DEC-195).
 pub const APPROVAL_LATE_ENTRY_SIZE: usize = 8;
-const APPROVAL_DEVIATION_SEQUENCE_OFFSET: usize = 8;
-const APPROVAL_M_OFFSET: usize = 12;
+/// Offset of the approval evidence's `deviation_sequence u32`; the
+/// `supporter_vote_sum u64` precedes it at offset 0.
+pub const APPROVAL_DEVIATION_SEQUENCE_OFFSET: usize = 8;
+/// Offset of the approval evidence's subgroup size `m u8`.
+pub const APPROVAL_M_OFFSET: usize = 12;
 /// `late_count` is a `u16` (DEC-242): a protocol bound of 65 535 late entries.
-const APPROVAL_LATE_COUNT_SIZE: usize = 2;
+/// It is the last field of [`approval_fixed_size`].
+pub const APPROVAL_LATE_COUNT_SIZE: usize = 2;
 /// The largest subgroup an evidence can name: `m = 2·r − 1` with
 /// `r ≤ MAX_AGGREGATED_SIGNATURES` (ADR-015).
-const APPROVAL_MAX_SUBGROUP: usize = 2 * MAX_AGGREGATED_SIGNATURES - 1;
+pub const APPROVAL_MAX_SUBGROUP: usize = 2 * MAX_AGGREGATED_SIGNATURES - 1;
+
+// `m` and a subgroup rank travel as a `u8`.
+const _: () = assert!(APPROVAL_MAX_SUBGROUP <= u8::MAX as usize);
 
 /// Length of an approval evidence payload without its late entries, for a
 /// subgroup of `m` and `n` signers: prefix, the `⌈m/8⌉ B` bitmap, the
