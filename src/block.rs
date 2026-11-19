@@ -288,7 +288,7 @@ impl<'a> BlockView<'a> {
             PAYLOAD_TYPE_CHAIN_CONFIG => {
                 crate::chain_config::content_end(payload)?.checked_add(SIGNATURE_SIZE)?
             }
-            PAYLOAD_TYPE_APPROVAL => approval_content_len(payload)?,
+            PAYLOAD_TYPE_APPROVAL => approval_frame(payload)?.len,
             _ => return None,
         };
 
@@ -328,6 +328,8 @@ impl<'a> BlockView<'a> {
 /// Offset of the approval evidence's signer bitmap: the payload starts with
 /// `supporter_vote_sum u64 ‖ deviation_sequence u32 ‖ m u8` (DEC-195).
 pub const APPROVAL_PREFIX_SIZE: usize = 13;
+/// Offset of the approval evidence's `supporter_vote_sum u64` (DEC-195, DEC-216).
+pub const APPROVAL_SUPPORTER_VOTE_SUM_OFFSET: usize = 0;
 /// Size of one approval late-node entry, `node_id u32 ‖ accumulated_vote u32`
 /// (DEC-184, DEC-195).
 pub const APPROVAL_LATE_ENTRY_SIZE: usize = 8;
@@ -368,8 +370,9 @@ pub const fn approval_fixed_size(m: usize, n: usize) -> usize {
 /// `≥ m` are counted but not judged here (that is Tier 1's). `None` for an `m`
 /// above `2·MAX_AGGREGATED_SIGNATURES − 1`, `n == 0`, `n` above
 /// `MAX_AGGREGATED_SIGNATURES`, a Schnorr aggregate whose `count` is not `n`,
-/// or a frame longer than `payload`.
-fn approval_content_len(payload: &[u8]) -> Option<usize> {
+/// or a frame longer than `payload`. The one framing of the layout: both
+/// [`BlockView::content_length`] and [`ApprovalView`] use it.
+fn approval_frame(payload: &[u8]) -> Option<ApprovalFrame> {
     let m = usize::from(*payload.get(APPROVAL_M_OFFSET)?);
     if m > APPROVAL_MAX_SUBGROUP {
         return None;
@@ -395,29 +398,86 @@ fn approval_content_len(payload: &[u8]) -> Option<usize> {
     let late_count = payload.get(fixed - APPROVAL_LATE_COUNT_SIZE..fixed)?;
     let late_count = usize::from(u16::from_le_bytes([late_count[0], late_count[1]]));
     let len = fixed + APPROVAL_LATE_ENTRY_SIZE * late_count;
-    (len <= payload.len()).then_some(len)
+    (len <= payload.len()).then_some(ApprovalFrame { len, fixed, n })
+}
+
+/// What [`approval_frame`] measured: the framed length, the fixed part's
+/// length (`approval_fixed_size(m, n)`) and the signer count `n`.
+struct ApprovalFrame {
+    len: usize,
+    fixed: usize,
+    n: usize,
 }
 
 /// Borrowed view of an approval evidence payload (`payload_type == 4`).
 ///
-/// Framed like [`BlockView::content_length`]'s approval arm. Story 6.6 reads
-/// only the deviation it approves; Story 6.7 adds the other accessors.
+/// Framed like [`BlockView::content_length`]'s approval arm, padding-tolerant
+/// (bytes after the framed length are not read). Story 6.6 reads the deviation
+/// it approves; Story 6.7's Tier-3 check and FR21 value read the rest.
 pub struct ApprovalView<'a> {
     bytes: &'a [u8],
+    fixed: usize,
+    n: usize,
 }
 
 impl<'a> ApprovalView<'a> {
     /// Frames `payload` as approval evidence; `None` when it does not frame.
     pub fn from_payload(payload: &'a [u8]) -> Option<Self> {
-        let len = approval_content_len(payload)?;
+        let frame = approval_frame(payload)?;
         Some(Self {
-            bytes: &payload[..len],
+            bytes: &payload[..frame.len],
+            fixed: frame.fixed,
+            n: frame.n,
         })
     }
 
     /// The sequence of the deviation block this evidence approves.
     pub fn deviation_sequence(&self) -> u32 {
         read_u32_le(self.bytes, APPROVAL_DEVIATION_SEQUENCE_OFFSET)
+    }
+
+    /// The claimed FR21 value, `B_k − cv(d)` (DEC-216); Tier 3 checks it.
+    pub fn supporter_vote_sum(&self) -> u64 {
+        read_u64_le(self.bytes, APPROVAL_SUPPORTER_VOTE_SUM_OFFSET)
+    }
+
+    /// The subgroup size `m` the evidence names.
+    pub fn m(&self) -> u8 {
+        self.bytes[APPROVAL_M_OFFSET]
+    }
+
+    /// The signer bitmap, `⌈m/8⌉` bytes: rank `j` is bit `j % 8` of byte `j / 8`
+    /// (LSB-first, DEC-241). Bits at positions `≥ m` are not judged here.
+    pub fn bitmap(&self) -> &'a [u8] {
+        &self.bytes[APPROVAL_PREFIX_SIZE..APPROVAL_PREFIX_SIZE + usize::from(self.m()).div_ceil(8)]
+    }
+
+    /// The bitmap's population count, the number of signers.
+    pub fn signer_count(&self) -> u32 {
+        self.n as u32
+    }
+
+    /// The aggregated signature in the crypto library's serialization (signers
+    /// in ascending rank order).
+    pub fn aggregate(&self) -> &'a [u8] {
+        let start = APPROVAL_PREFIX_SIZE + usize::from(self.m()).div_ceil(8);
+        &self.bytes[start..self.fixed - APPROVAL_LATE_COUNT_SIZE]
+    }
+
+    /// The number of late-node entries (DEC-184, DEC-242).
+    pub fn late_count(&self) -> u16 {
+        let at = self.fixed - APPROVAL_LATE_COUNT_SIZE;
+        u16::from_le_bytes([self.bytes[at], self.bytes[at + 1]])
+    }
+
+    /// Late entry `i` as `(node_id, accumulated_vote)`; `None` for
+    /// `i ≥ late_count`.
+    pub fn late_entry(&self, i: usize) -> Option<(u32, u32)> {
+        if i >= usize::from(self.late_count()) {
+            return None;
+        }
+        let at = self.fixed + APPROVAL_LATE_ENTRY_SIZE * i;
+        Some((read_u32_le(self.bytes, at), read_u32_le(self.bytes, at + 4)))
     }
 }
 
@@ -1526,6 +1586,43 @@ mod tests {
             None,
             "a Schnorr aggregate whose count is not the bitmap's population"
         );
+    }
+
+    /// Story 6.7 AC2: every field of a real evidence block reads back as written,
+    /// a rank-8 signer on the bitmap's second byte included (LSB-first).
+    #[test]
+    fn approval_view_reads_every_field() {
+        let held = [0usize, 3, 8];
+        let block = approval_block(9, &held, 3);
+        let view = ApprovalView::from_payload(block.view().payload()).expect("frames");
+        assert_eq!(view.supporter_vote_sum(), 0x0102_0304_0506_0708);
+        assert_eq!(view.deviation_sequence(), APPROVAL_DEVIATION);
+        assert_eq!(view.m(), 9);
+        assert_eq!(view.bitmap(), &[0b0000_1001, 0b0000_0001]);
+        assert_eq!(view.signer_count(), held.len() as u32);
+        let fixed = approval_fixed_size(9, held.len());
+        assert_eq!(
+            view.aggregate().len(),
+            fixed - APPROVAL_PREFIX_SIZE - 2 - APPROVAL_LATE_COUNT_SIZE
+        );
+        use moonblokz_crypto::{AggregatedSignature, AggregatedSignatureTrait};
+        let aggregate = AggregatedSignature::new(view.aggregate())
+            .ok()
+            .expect("the aggregate parses");
+        assert_eq!(aggregate.get_count(), held.len());
+        assert_eq!(view.late_count(), 3);
+        for i in 0..3 {
+            assert_eq!(view.late_entry(i), Some((i as u32 + 100, i as u32 * 10)));
+        }
+        assert_eq!(view.late_entry(3), None);
+        // Padding after the frame is not read.
+        let mut padded = [0u8; MAX_PAYLOAD_SIZE];
+        let payload = block.view().payload();
+        padded[..payload.len()].copy_from_slice(payload);
+        padded[payload.len()..].fill(0xAA);
+        let view = ApprovalView::from_payload(&padded).expect("frames with padding");
+        assert_eq!(view.late_count(), 3);
+        assert_eq!(view.late_entry(3), None);
     }
 
     #[test]
