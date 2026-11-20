@@ -89,6 +89,8 @@ pub const SIGNING_PREIMAGE_SIZE: usize = SIGNATURE_OFFSET + HASH_SIZE;
 // version byte. A node transfer is the one fixed-size signed transaction whose
 // type byte (1) equals the block version (1), so the two must differ in length.
 const _: () = assert!(SIGNING_PREIMAGE_SIZE != crate::transaction::NODE_TRANSFER_SIZE);
+// `build_signed` writes the payload hash into the signature field to sign.
+const _: () = assert!(SIGNING_PREIMAGE_SIZE <= HEADER_SIZE);
 
 /// The FR70 preimage over a header's first `SIGNATURE_OFFSET` bytes and its payload's
 /// hash.
@@ -1064,11 +1066,14 @@ impl BlockBuilder {
                 .copy_from_slice(&self.payload[..self.payload_len]);
         }
 
-        // FR70: the signature field is not part of what is signed.
-        let signature = crypto.sign(&signing_preimage(
-            &data,
-            &calculate_hash(&data[PAYLOAD_OFFSET..len]),
-        ));
+        // FR70: the signature field is not part of what is signed. With
+        // `H(payload)` written where the signature goes, the preimage is
+        // `data[..SIGNING_PREIMAGE_SIZE]`: no second buffer stays live
+        // across the signing call (stack budget), and the signature then
+        // overwrites the hash.
+        let payload_hash = calculate_hash(&data[PAYLOAD_OFFSET..len]);
+        data[SIGNATURE_OFFSET..SIGNING_PREIMAGE_SIZE].copy_from_slice(&payload_hash);
+        let signature = crypto.sign(&data[..SIGNING_PREIMAGE_SIZE]);
         data[SIGNATURE_OFFSET..HEADER_SIZE].copy_from_slice(signature.serialize());
 
         Ok(Block { data, len })
