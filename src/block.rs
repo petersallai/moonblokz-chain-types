@@ -83,7 +83,7 @@ const _: () = assert!(PAYLOAD_OFFSET == HEADER_SIZE);
 /// Length of the block-creator signature preimage (FR70, DEC-272): the header bytes
 /// before the signature field followed by the SHA-256 hash of the payload — 90 bytes
 /// under every signature scheme, since the signature is the header's last field.
-pub const SIGNING_PREIMAGE_SIZE: usize = SIGNATURE_OFFSET + HASH_SIZE;
+const SIGNING_PREIMAGE_SIZE: usize = SIGNATURE_OFFSET + HASH_SIZE;
 
 // Domain separation is by message form (DEC-248): the preimage starts with the
 // version byte. A node transfer is the one fixed-size signed transaction whose
@@ -91,15 +91,6 @@ pub const SIGNING_PREIMAGE_SIZE: usize = SIGNATURE_OFFSET + HASH_SIZE;
 const _: () = assert!(SIGNING_PREIMAGE_SIZE != crate::transaction::NODE_TRANSFER_SIZE);
 // `build_signed` writes the payload hash into the signature field to sign.
 const _: () = assert!(SIGNING_PREIMAGE_SIZE <= HEADER_SIZE);
-
-/// The FR70 preimage over a header's first `SIGNATURE_OFFSET` bytes and its payload's
-/// hash.
-fn signing_preimage(header: &[u8], payload_hash: &[u8; HASH_SIZE]) -> [u8; SIGNING_PREIMAGE_SIZE] {
-    let mut preimage = [0u8; SIGNING_PREIMAGE_SIZE];
-    preimage[..SIGNATURE_OFFSET].copy_from_slice(&header[..SIGNATURE_OFFSET]);
-    preimage[SIGNATURE_OFFSET..].copy_from_slice(payload_hash);
-    preimage
-}
 
 /// Maximum payload bytes that can fit in a block.
 pub const MAX_PAYLOAD_SIZE: usize = MAX_BLOCK_SIZE - HEADER_SIZE;
@@ -283,7 +274,10 @@ impl<'a> BlockView<'a> {
     /// payload hash verifies the signature. The view's length is the payload's end,
     /// so a padded storage slot must be cut to the block's exact length first.
     pub fn signing_preimage(&self) -> [u8; SIGNING_PREIMAGE_SIZE] {
-        signing_preimage(self.bytes, &calculate_hash(self.payload()))
+        let mut preimage = [0u8; SIGNING_PREIMAGE_SIZE];
+        preimage[..SIGNATURE_OFFSET].copy_from_slice(&self.bytes[..SIGNATURE_OFFSET]);
+        preimage[SIGNATURE_OFFSET..].copy_from_slice(&calculate_hash(self.payload()));
+        preimage
     }
 
     /// Recovers the block's **exact** serialized byte length by walking its
