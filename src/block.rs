@@ -80,6 +80,25 @@ const _: () = assert!(SIGNATURE_OFFSET + SIGNATURE_SIZE == HEADER_SIZE);
 const _: () = assert!(PREVIOUS_HASH_OFFSET + 32 == SIGNATURE_OFFSET);
 const _: () = assert!(PAYLOAD_OFFSET == HEADER_SIZE);
 
+/// Length of the block-creator signature preimage (FR70, DEC-272): the header bytes
+/// before the signature field followed by the SHA-256 hash of the payload — 90 bytes
+/// under every signature scheme, since the signature is the header's last field.
+pub const SIGNING_PREIMAGE_SIZE: usize = SIGNATURE_OFFSET + HASH_SIZE;
+
+// Domain separation is by message form (DEC-248): the preimage starts with the
+// version byte. A node transfer is the one fixed-size signed transaction whose
+// type byte (1) equals the block version (1), so the two must differ in length.
+const _: () = assert!(SIGNING_PREIMAGE_SIZE != crate::transaction::NODE_TRANSFER_SIZE);
+
+/// The FR70 preimage over a header's first `SIGNATURE_OFFSET` bytes and its payload's
+/// hash.
+fn signing_preimage(header: &[u8], payload_hash: &[u8; HASH_SIZE]) -> [u8; SIGNING_PREIMAGE_SIZE] {
+    let mut preimage = [0u8; SIGNING_PREIMAGE_SIZE];
+    preimage[..SIGNATURE_OFFSET].copy_from_slice(&header[..SIGNATURE_OFFSET]);
+    preimage[SIGNATURE_OFFSET..].copy_from_slice(payload_hash);
+    preimage
+}
+
 /// Maximum payload bytes that can fit in a block.
 pub const MAX_PAYLOAD_SIZE: usize = MAX_BLOCK_SIZE - HEADER_SIZE;
 
@@ -255,6 +274,14 @@ impl<'a> BlockView<'a> {
     /// Returns the payload slice.
     pub fn payload(&self) -> &'a [u8] {
         &self.bytes[PAYLOAD_OFFSET..self.bytes.len()]
+    }
+
+    /// The bytes the block-creator signature signs (FR70, DEC-272): the header
+    /// before the signature field followed by `H(payload)`, so a header plus its
+    /// payload hash verifies the signature. The view's length is the payload's end,
+    /// so a padded storage slot must be cut to the block's exact length first.
+    pub fn signing_preimage(&self) -> [u8; SIGNING_PREIMAGE_SIZE] {
+        signing_preimage(self.bytes, &calculate_hash(self.payload()))
     }
 
     /// Recovers the block's **exact** serialized byte length by walking its
@@ -818,8 +845,8 @@ impl BlockBuilder {
     /// (`block == [header | payload]`) that chain-config content-matching relies
     /// on. This sets `payload_type` to `PAYLOAD_TYPE_CHAIN_CONFIG` and must be the
     /// only payload-setting call on the builder; an empty `bytes` slice yields a
-    /// header-only chain-config block. Because the payload is signed as part of
-    /// `build_signed`'s canonical bytes, this produces a Block #1 whose signature
+    /// header-only chain-config block. Because the payload's hash is signed
+    /// by `build_signed` (FR70), this produces a Block #1 whose signature
     /// covers its chain-config content (the genesis FR54 second block).
     pub fn set_chain_config_payload(&mut self, bytes: &[u8]) -> Result<&mut Self, BlockError> {
         if self.payload_len != 0 {
@@ -953,9 +980,10 @@ impl BlockBuilder {
 
     /// Builds and signs the immutable block.
     ///
-    /// The signing input is the full canonical block byte sequence with the
-    /// header signature field zero-filled. The returned owned [`Block`] stores
-    /// the signer-produced signature in the header signature field.
+    /// The signing input is the FR70 preimage ([`BlockView::signing_preimage`]):
+    /// the header before the signature field followed by `H(payload)`. The
+    /// returned owned [`Block`] stores the signer-produced signature in the
+    /// header signature field.
     /// `BlockHeader::signature` is intentionally ignored: builders must finish
     /// through this method so callers cannot accidentally construct unsigned
     /// blocks.
@@ -1030,17 +1058,17 @@ impl BlockBuilder {
             );
         data[PREVIOUS_HASH_OFFSET..PREVIOUS_HASH_OFFSET + 32]
             .copy_from_slice(&self.header.previous_hash);
-        // The signature signs the full canonical block with this field
-        // zero-filled. This avoids a self-referential signature while still
-        // including the payload bytes in the signed content.
-        data[SIGNATURE_OFFSET..HEADER_SIZE].copy_from_slice(&[0u8; SIGNATURE_SIZE]);
 
         if self.payload_len > 0 {
             data[PAYLOAD_OFFSET..PAYLOAD_OFFSET + self.payload_len]
                 .copy_from_slice(&self.payload[..self.payload_len]);
         }
 
-        let signature = crypto.sign(&data[..len]);
+        // FR70: the signature field is not part of what is signed.
+        let signature = crypto.sign(&signing_preimage(
+            &data,
+            &calculate_hash(&data[PAYLOAD_OFFSET..len]),
+        ));
         data[SIGNATURE_OFFSET..HEADER_SIZE].copy_from_slice(signature.serialize());
 
         Ok(Block { data, len })
@@ -2227,5 +2255,120 @@ mod tests {
             .unwrap();
         let view = BlockView::from_bytes(block.serialized_bytes()).unwrap();
         assert!(view.balances().is_none());
+    }
+
+    // ===================================================================
+    // FR70 creator-signature preimage (Story 6.12, DEC-272)
+    // ===================================================================
+
+    fn preimage_block() -> Block {
+        let mut builder = BlockBuilder::new().header(BlockHeader {
+            version: 1,
+            sequence: 0x04030201,
+            creator: 0x08070605,
+            mined_amount: 0x0C0B0A09,
+            payload_type: 0,
+            consumed_votes: 0x11100F0E,
+            first_voted_node: 0x15141312,
+            consumed_votes_from_first_voted_node: 0x19181716,
+            previous_hash: [0xAA; 32],
+            signature: [0xBB; SIGNATURE_SIZE],
+        });
+        builder.set_chain_config_payload(&[1, 2, 3]).unwrap();
+        builder.build_signed(&test_crypto()).unwrap()
+    }
+
+    fn signature_verifies(bytes: &[u8]) -> bool {
+        let view = BlockView::from_bytes(bytes).unwrap();
+        let crypto = test_crypto();
+        let signature = moonblokz_crypto::Signature::new(view.signature())
+            .ok()
+            .expect("a block carries a well-formed signature");
+        crypto.verify_signature(&view.signing_preimage(), &signature, crypto.public_key())
+    }
+
+    /// The golden: the 58 header bytes before the signature, then SHA-256 of the
+    /// payload, pinned byte by byte — 90 bytes under every scheme.
+    #[test]
+    fn signing_preimage_is_the_header_before_the_signature_then_the_payload_hash() {
+        let block = preimage_block();
+        let mut expected = [0u8; 90];
+        expected[..26].copy_from_slice(&[
+            1, // version
+            0x01,
+            0x02,
+            0x03,
+            0x04, // sequence LE
+            0x05,
+            0x06,
+            0x07,
+            0x08, // creator LE
+            0x09,
+            0x0A,
+            0x0B,
+            0x0C, // mined_amount LE
+            PAYLOAD_TYPE_CHAIN_CONFIG,
+            0x0E,
+            0x0F,
+            0x10,
+            0x11, // consumed_votes LE
+            0x12,
+            0x13,
+            0x14,
+            0x15, // first_voted_node LE
+            0x16,
+            0x17,
+            0x18,
+            0x19, // consumed_votes_from_first_voted_node LE
+        ]);
+        expected[26..58].copy_from_slice(&[0xAA; 32]);
+        // SHA-256(01 02 03).
+        expected[58..].copy_from_slice(&[
+            0x03, 0x90, 0x58, 0xc6, 0xf2, 0xc0, 0xcb, 0x49, 0x2c, 0x53, 0x3b, 0x0a, 0x4d, 0x14,
+            0xef, 0x77, 0xcc, 0x0f, 0x78, 0xab, 0xcc, 0xce, 0xd5, 0x28, 0x7d, 0x84, 0xa1, 0xa2,
+            0x01, 0x1c, 0xfb, 0x81,
+        ]);
+        assert_eq!(SIGNING_PREIMAGE_SIZE, 90);
+        assert_eq!(block.view().signing_preimage(), expected);
+    }
+
+    #[test]
+    fn build_signed_signs_the_preimage() {
+        let block = preimage_block();
+        assert!(signature_verifies(block.serialized_bytes()));
+        // Not the whole block with the signature zero-filled (the pre-FR70 form).
+        let mut zeroed = [0u8; MAX_BLOCK_SIZE];
+        let bytes = block.serialized_bytes();
+        zeroed[..bytes.len()].copy_from_slice(bytes);
+        zeroed[SIGNATURE_OFFSET..HEADER_SIZE].fill(0);
+        let crypto = test_crypto();
+        let signature = moonblokz_crypto::Signature::new(block.signature())
+            .ok()
+            .expect("well-formed");
+        assert!(!crypto.verify_signature(&zeroed[..bytes.len()], &signature, crypto.public_key()));
+    }
+
+    #[test]
+    fn a_payload_or_header_byte_flip_breaks_the_signature() {
+        let block = preimage_block();
+        let len = block.len();
+        for at in [HEADER_SIZE + 1, CREATOR_OFFSET, PREVIOUS_HASH_OFFSET + 31] {
+            let mut bytes = [0u8; MAX_BLOCK_SIZE];
+            bytes[..len].copy_from_slice(block.serialized_bytes());
+            bytes[at] ^= 0x01;
+            assert!(!signature_verifies(&bytes[..len]), "flip at {at}");
+        }
+    }
+
+    #[test]
+    fn the_signature_field_changes_the_hash_not_the_preimage() {
+        let block = preimage_block();
+        let len = block.len();
+        let mut bytes = [0u8; MAX_BLOCK_SIZE];
+        bytes[..len].copy_from_slice(block.serialized_bytes());
+        bytes[SIGNATURE_OFFSET] ^= 0x01;
+        let flipped = BlockView::from_bytes(&bytes[..len]).unwrap();
+        assert_ne!(flipped.hash(), block.hash());
+        assert_eq!(flipped.signing_preimage(), block.view().signing_preimage());
     }
 }
