@@ -105,7 +105,7 @@ pub const PAYLOAD_TYPE_CHAIN_CONFIG: u8 = 3;
 pub const PAYLOAD_TYPE_APPROVAL: u8 = 4;
 /// Payload type: twin fact block (FR70–FR72): the proof that the creator of the
 /// branch's block at the proof's sequence signed a second child of the same parent.
-pub const PAYLOAD_TYPE_TWIN_EVIDENCE: u8 = 5;
+pub const PAYLOAD_TYPE_TWIN_FACT: u8 = 5;
 
 /// Parsed view of the fixed block header.
 ///
@@ -312,7 +312,7 @@ impl<'a> BlockView<'a> {
                 crate::chain_config::content_end(payload)?.checked_add(SIGNATURE_SIZE)?
             }
             PAYLOAD_TYPE_APPROVAL => approval_frame(payload)?.len,
-            PAYLOAD_TYPE_TWIN_EVIDENCE => twin_frame(payload)?,
+            PAYLOAD_TYPE_TWIN_FACT => twin_frame(payload)?,
             _ => return None,
         };
 
@@ -352,7 +352,7 @@ impl<'a> BlockView<'a> {
 /// The FR70 preimage (DEC-272) of a header whose first `SIGNATURE_OFFSET` bytes are
 /// `header` and whose payload hashes to `payload_hash`. The one statement of the
 /// preimage: a block's own ([`BlockView::signing_preimage`]) and a twin proof's
-/// ([`TwinEvidenceView::proof_signing_preimage`]).
+/// ([`TwinFactView::proof_signing_preimage`]).
 fn signing_preimage_of(
     header: &[u8],
     payload_hash: &[u8; HASH_SIZE],
@@ -526,18 +526,18 @@ const TWIN_SNAPSHOT_OFFSET: usize = HEADER_SIZE + HASH_SIZE;
 const TWIN_M_OFFSET: usize = TWIN_SNAPSHOT_OFFSET + 4;
 /// Size of a twin fact block payload without members: a penalty-only block
 /// (`m = 0`). 159 / 143 / 191 B with Schnorr / `bls-min-sig` / `bls-min-pk`.
-pub const TWIN_PREFIX_SIZE: usize = TWIN_M_OFFSET + 1;
+pub const TWIN_FACT_PREFIX_SIZE: usize = TWIN_M_OFFSET + 1;
 
 /// Length of a twin fact block payload naming `m` subgroup members (FR71,
 /// DEC-278, little-endian): `proof_header[HEADER_SIZE] ‖ proof_payload_hash[32] ‖
 /// snapshot u32 ‖ m u8 ‖ members[m] u32`. The one statement of the layout, shared by
 /// the framing and the writer.
-pub const fn twin_evidence_size(m: usize) -> usize {
-    TWIN_PREFIX_SIZE + 4 * m
+pub const fn twin_fact_size(m: usize) -> usize {
+    TWIN_FACT_PREFIX_SIZE + 4 * m
 }
 
 // The largest round-opening fact block fits every block-size tier's payload.
-const _: () = assert!(twin_evidence_size(APPROVAL_MAX_SUBGROUP) <= MAX_PAYLOAD_SIZE);
+const _: () = assert!(twin_fact_size(APPROVAL_MAX_SUBGROUP) <= MAX_PAYLOAD_SIZE);
 
 /// Frames a twin fact block payload: its length, or `None` for an `m` above
 /// [`APPROVAL_MAX_SUBGROUP`] or a frame longer than `payload`.
@@ -546,7 +546,7 @@ fn twin_frame(payload: &[u8]) -> Option<usize> {
     if m > APPROVAL_MAX_SUBGROUP {
         return None;
     }
-    let len = twin_evidence_size(m);
+    let len = twin_fact_size(m);
     (len <= payload.len()).then_some(len)
 }
 
@@ -557,11 +557,11 @@ fn twin_frame(payload: &[u8]) -> Option<usize> {
 /// header's creator, sequence and previous hash. `m = 0` is a penalty-only block;
 /// `m ≥ 1` opens an approval round whose ranked subgroup is `members`. Framed like
 /// [`BlockView::content_length`]'s arm, padding-tolerant.
-pub struct TwinEvidenceView<'a> {
+pub struct TwinFactView<'a> {
     bytes: &'a [u8],
 }
 
-impl<'a> TwinEvidenceView<'a> {
+impl<'a> TwinFactView<'a> {
     /// Frames `payload` as a twin fact block; `None` when it does not frame.
     pub fn from_payload(payload: &'a [u8]) -> Option<Self> {
         let len = twin_frame(payload)?;
@@ -625,7 +625,7 @@ impl<'a> TwinEvidenceView<'a> {
 
     /// Subgroup member `i` in ascending `node_value` order; `None` for `i ≥ m`.
     pub fn member(&self, i: usize) -> Option<u32> {
-        (i < usize::from(self.m())).then(|| read_u32_le(self.bytes, TWIN_PREFIX_SIZE + 4 * i))
+        (i < usize::from(self.m())).then(|| read_u32_le(self.bytes, TWIN_FACT_PREFIX_SIZE + 4 * i))
     }
 }
 
@@ -1004,9 +1004,9 @@ impl BlockBuilder {
     /// Sets the twin fact block payload's length to `len` and hands out the
     /// builder's payload buffer to write it in place, as
     /// [`approval_payload_mut`](Self::approval_payload_mut) does for type 4. Sets
-    /// `payload_type` to `PAYLOAD_TYPE_TWIN_EVIDENCE`.
-    pub fn twin_evidence_payload_mut(&mut self, len: usize) -> Result<&mut [u8], BlockError> {
-        self.raw_payload_mut(len, PAYLOAD_TYPE_TWIN_EVIDENCE)
+    /// `payload_type` to `PAYLOAD_TYPE_TWIN_FACT`.
+    pub fn twin_fact_payload_mut(&mut self, len: usize) -> Result<&mut [u8], BlockError> {
+        self.raw_payload_mut(len, PAYLOAD_TYPE_TWIN_FACT)
     }
 
     /// The in-place writers' common body: refused when the header names another
@@ -2522,10 +2522,10 @@ mod tests {
         out[TWIN_SNAPSHOT_OFFSET..TWIN_M_OFFSET].copy_from_slice(&snapshot.to_le_bytes());
         out[TWIN_M_OFFSET] = u8::try_from(members.len()).unwrap();
         for (i, member) in members.iter().enumerate() {
-            let at = TWIN_PREFIX_SIZE + 4 * i;
+            let at = TWIN_FACT_PREFIX_SIZE + 4 * i;
             out[at..at + 4].copy_from_slice(&member.to_le_bytes());
         }
-        twin_evidence_size(members.len())
+        twin_fact_size(members.len())
     }
 
     fn twin_block(members: &[u32]) -> Block {
@@ -2535,7 +2535,7 @@ mod tests {
             ..sample_header()
         });
         let out = builder
-            .twin_evidence_payload_mut(twin_evidence_size(members.len()))
+            .twin_fact_payload_mut(twin_fact_size(members.len()))
             .unwrap();
         write_twin(out, &twin.view(), 0x0D0C_0B0A, members);
         builder.build_signed(&test_crypto()).unwrap()
@@ -2548,7 +2548,7 @@ mod tests {
             ..sample_header()
         });
         builder
-            .twin_evidence_payload_mut(payload.len())
+            .twin_fact_payload_mut(payload.len())
             .unwrap()
             .copy_from_slice(payload);
         builder.build_signed(&test_crypto()).unwrap()
@@ -2559,8 +2559,8 @@ mod tests {
         let twin = preimage_block();
         let block = twin_block(&[3, 1, 4]);
         let view = block.view();
-        assert_eq!(view.payload_type(), PAYLOAD_TYPE_TWIN_EVIDENCE);
-        let proof = TwinEvidenceView::from_payload(view.payload()).expect("frames");
+        assert_eq!(view.payload_type(), PAYLOAD_TYPE_TWIN_FACT);
+        let proof = TwinFactView::from_payload(view.payload()).expect("frames");
         assert_eq!(
             proof.proof_header(),
             &twin.serialized_bytes()[..HEADER_SIZE]
@@ -2583,17 +2583,20 @@ mod tests {
             [Some(3), Some(1), Some(4), None]
         );
         assert_eq!(view.content_length(), Some(block.len()));
-        assert_eq!(block.len(), HEADER_SIZE + twin_evidence_size(3));
+        assert_eq!(block.len(), HEADER_SIZE + twin_fact_size(3));
         assert_recovers(&block);
     }
 
     #[test]
     fn a_penalty_only_block_frames_without_members() {
         let block = twin_block(&[]);
-        let proof = TwinEvidenceView::from_payload(block.payload()).expect("frames");
+        let proof = TwinFactView::from_payload(block.payload()).expect("frames");
         assert_eq!(proof.m(), 0);
         assert_eq!(proof.member(0), None);
-        assert_eq!(block.content_length(), Some(HEADER_SIZE + TWIN_PREFIX_SIZE));
+        assert_eq!(
+            block.content_length(),
+            Some(HEADER_SIZE + TWIN_FACT_PREFIX_SIZE)
+        );
         assert_recovers(&block);
     }
 
@@ -2633,9 +2636,9 @@ mod tests {
         let expected = (191, 507, 587);
         assert_eq!(
             (
-                TWIN_PREFIX_SIZE,
-                twin_evidence_size(79),
-                twin_evidence_size(99)
+                TWIN_FACT_PREFIX_SIZE,
+                twin_fact_size(79),
+                twin_fact_size(99)
             ),
             expected
         );
@@ -2647,24 +2650,24 @@ mod tests {
         let payload = full.payload();
         // Cut before `m`.
         assert!(
-            raw_twin_block(&payload[..TWIN_PREFIX_SIZE - 1])
+            raw_twin_block(&payload[..TWIN_FACT_PREFIX_SIZE - 1])
                 .content_length()
                 .is_none()
         );
         // `m = 2` with one member.
         assert!(
-            raw_twin_block(&payload[..TWIN_PREFIX_SIZE + 4])
+            raw_twin_block(&payload[..TWIN_FACT_PREFIX_SIZE + 4])
                 .content_length()
                 .is_none()
         );
         // `m` above the largest subgroup.
-        let mut over = [0u8; TWIN_PREFIX_SIZE + 4 * (APPROVAL_MAX_SUBGROUP + 1)];
-        over[..TWIN_PREFIX_SIZE].copy_from_slice(&payload[..TWIN_PREFIX_SIZE]);
+        let mut over = [0u8; TWIN_FACT_PREFIX_SIZE + 4 * (APPROVAL_MAX_SUBGROUP + 1)];
+        over[..TWIN_FACT_PREFIX_SIZE].copy_from_slice(&payload[..TWIN_FACT_PREFIX_SIZE]);
         over[TWIN_M_OFFSET] = u8::try_from(APPROVAL_MAX_SUBGROUP + 1).unwrap();
         assert!(raw_twin_block(&over).content_length().is_none());
-        assert!(TwinEvidenceView::from_payload(&over).is_none());
+        assert!(TwinFactView::from_payload(&over).is_none());
         // Bytes after the framed length are padding: the frame stays shorter.
-        let mut trailing = [0u8; TWIN_PREFIX_SIZE + 4 * 2 + 3];
+        let mut trailing = [0u8; TWIN_FACT_PREFIX_SIZE + 4 * 2 + 3];
         trailing[..payload.len()].copy_from_slice(payload);
         let block = raw_twin_block(&trailing);
         assert_eq!(block.content_length(), Some(full.len()));
@@ -2677,7 +2680,7 @@ mod tests {
     fn the_proof_preimage_is_the_twins_own_and_verifies() {
         let twin = preimage_block();
         let block = twin_block(&[]);
-        let proof = TwinEvidenceView::from_payload(block.payload()).unwrap();
+        let proof = TwinFactView::from_payload(block.payload()).unwrap();
         assert_eq!(
             proof.proof_signing_preimage(),
             twin.view().signing_preimage()
@@ -2694,10 +2697,10 @@ mod tests {
     }
 
     #[test]
-    fn twin_evidence_payload_mut_sets_the_type_and_refuses_a_mismatch() {
+    fn twin_fact_payload_mut_sets_the_type_and_refuses_a_mismatch() {
         let mut builder = BlockBuilder::new().header(sample_header());
         assert!(
-            builder.twin_evidence_payload_mut(4).is_err(),
+            builder.twin_fact_payload_mut(4).is_err(),
             "header names type 3"
         );
         let mut builder = BlockBuilder::new().header(BlockHeader {
@@ -2705,24 +2708,20 @@ mod tests {
             ..sample_header()
         });
         assert!(
-            builder.twin_evidence_payload_mut(4).is_err(),
+            builder.twin_fact_payload_mut(4).is_err(),
             "header names type 4"
         );
         let mut builder = BlockBuilder::new().header(BlockHeader {
             payload_type: 0,
             ..sample_header()
         });
-        assert!(
-            builder
-                .twin_evidence_payload_mut(MAX_PAYLOAD_SIZE + 1)
-                .is_err()
-        );
-        assert!(builder.twin_evidence_payload_mut(4).is_ok());
+        assert!(builder.twin_fact_payload_mut(MAX_PAYLOAD_SIZE + 1).is_err());
+        assert!(builder.twin_fact_payload_mut(4).is_ok());
         assert!(
             builder.approval_payload_mut(4).is_err(),
             "no approval after it"
         );
         let block = builder.build_signed(&test_crypto()).expect("signs");
-        assert_eq!(block.view().payload_type(), PAYLOAD_TYPE_TWIN_EVIDENCE);
+        assert_eq!(block.view().payload_type(), PAYLOAD_TYPE_TWIN_FACT);
     }
 }
