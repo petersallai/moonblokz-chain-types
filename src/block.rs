@@ -530,14 +530,30 @@ pub const TWIN_FACT_PREFIX_SIZE: usize = TWIN_M_OFFSET + 1;
 
 /// Length of a twin fact block payload naming `m` subgroup members (FR71,
 /// DEC-278, little-endian): `proof_header[HEADER_SIZE] ‖ proof_payload_hash[32] ‖
-/// snapshot u32 ‖ m u8 ‖ members[m] u32`. The one statement of the layout, shared by
-/// the framing and the writer.
+/// snapshot u32 ‖ m u8`, and for a round-opening block (`m ≥ 1`) the round's
+/// index `j u32` (the opener's creator rank, which keys the supporters' ring,
+/// Story 6.13 code review DN1) ‖ `members[m] u32`. The one statement of the
+/// layout, shared by the framing and the writer.
 pub const fn twin_fact_size(m: usize) -> usize {
-    TWIN_FACT_PREFIX_SIZE + 4 * m
+    if m == 0 {
+        TWIN_FACT_PREFIX_SIZE
+    } else {
+        TWIN_FACT_PREFIX_SIZE + 4 + 4 * m
+    }
 }
 
 // The largest round-opening fact block fits every block-size tier's payload.
 const _: () = assert!(twin_fact_size(APPROVAL_MAX_SUBGROUP) <= MAX_PAYLOAD_SIZE);
+// The ratified sizes per scheme: penalty-only, a round of 79 and of 99 members.
+#[cfg(feature = "schnorr")]
+const _: () =
+    assert!(TWIN_FACT_PREFIX_SIZE == 159 && twin_fact_size(79) == 479 && twin_fact_size(99) == 559);
+#[cfg(feature = "bls-min-sig")]
+const _: () =
+    assert!(TWIN_FACT_PREFIX_SIZE == 143 && twin_fact_size(79) == 463 && twin_fact_size(99) == 543);
+#[cfg(feature = "bls-min-pk")]
+const _: () =
+    assert!(TWIN_FACT_PREFIX_SIZE == 191 && twin_fact_size(79) == 511 && twin_fact_size(99) == 591);
 
 /// Frames a twin fact block payload: its length, or `None` for an `m` above
 /// [`APPROVAL_MAX_SUBGROUP`] or a frame longer than `payload`.
@@ -623,9 +639,16 @@ impl<'a> TwinFactView<'a> {
         self.bytes[TWIN_M_OFFSET]
     }
 
+    /// The round's index `j` (the opener's creator rank at its parent); `None`
+    /// for a penalty-only block.
+    pub fn round(&self) -> Option<u32> {
+        (self.m() > 0).then(|| read_u32_le(self.bytes, TWIN_FACT_PREFIX_SIZE))
+    }
+
     /// Subgroup member `i` in ascending `node_value` order; `None` for `i ≥ m`.
     pub fn member(&self, i: usize) -> Option<u32> {
-        (i < usize::from(self.m())).then(|| read_u32_le(self.bytes, TWIN_FACT_PREFIX_SIZE + 4 * i))
+        (i < usize::from(self.m()))
+            .then(|| read_u32_le(self.bytes, TWIN_FACT_PREFIX_SIZE + 4 + 4 * i))
     }
 }
 
@@ -2521,12 +2544,18 @@ mod tests {
         out[HEADER_SIZE..TWIN_SNAPSHOT_OFFSET].copy_from_slice(&calculate_hash(twin.payload()));
         out[TWIN_SNAPSHOT_OFFSET..TWIN_M_OFFSET].copy_from_slice(&snapshot.to_le_bytes());
         out[TWIN_M_OFFSET] = u8::try_from(members.len()).unwrap();
+        if !members.is_empty() {
+            out[TWIN_FACT_PREFIX_SIZE..TWIN_FACT_PREFIX_SIZE + 4]
+                .copy_from_slice(&TEST_ROUND.to_le_bytes());
+        }
         for (i, member) in members.iter().enumerate() {
-            let at = TWIN_FACT_PREFIX_SIZE + 4 * i;
+            let at = TWIN_FACT_PREFIX_SIZE + 4 + 4 * i;
             out[at..at + 4].copy_from_slice(&member.to_le_bytes());
         }
         twin_fact_size(members.len())
     }
+
+    const TEST_ROUND: u32 = 0x1314_1516;
 
     fn twin_block(members: &[u32]) -> Block {
         let twin = preimage_block();
@@ -2573,6 +2602,7 @@ mod tests {
         assert_eq!(proof.proof_payload_hash(), &calculate_hash(twin.payload()));
         assert_eq!(proof.snapshot(), 0x0D0C_0B0A);
         assert_eq!(proof.m(), 3);
+        assert_eq!(proof.round(), Some(TEST_ROUND));
         assert_eq!(
             [
                 proof.member(0),
@@ -2592,6 +2622,7 @@ mod tests {
         let block = twin_block(&[]);
         let proof = TwinFactView::from_payload(block.payload()).expect("frames");
         assert_eq!(proof.m(), 0);
+        assert_eq!(proof.round(), None);
         assert_eq!(proof.member(0), None);
         assert_eq!(
             block.content_length(),
@@ -2620,6 +2651,7 @@ mod tests {
             &[
                 0x0A, 0x0B, 0x0C, 0x0D, // snapshot LE
                 2,    // m
+                0x16, 0x15, 0x14, 0x13, // j LE
                 0x04, 0x03, 0x02, 0x01, // member 0 LE
                 0x08, 0x07, 0x06, 0x05, // member 1 LE
             ]
@@ -2629,11 +2661,11 @@ mod tests {
     #[test]
     fn twin_sizes_match_the_ratified_figures() {
         #[cfg(feature = "schnorr")]
-        let expected = (159, 475, 555);
+        let expected = (159, 479, 559);
         #[cfg(feature = "bls-min-sig")]
-        let expected = (143, 459, 539);
+        let expected = (143, 463, 543);
         #[cfg(feature = "bls-min-pk")]
-        let expected = (191, 507, 587);
+        let expected = (191, 511, 591);
         assert_eq!(
             (
                 TWIN_FACT_PREFIX_SIZE,
@@ -2656,18 +2688,18 @@ mod tests {
         );
         // `m = 2` with one member.
         assert!(
-            raw_twin_block(&payload[..TWIN_FACT_PREFIX_SIZE + 4])
+            raw_twin_block(&payload[..TWIN_FACT_PREFIX_SIZE + 4 + 4])
                 .content_length()
                 .is_none()
         );
         // `m` above the largest subgroup.
-        let mut over = [0u8; TWIN_FACT_PREFIX_SIZE + 4 * (APPROVAL_MAX_SUBGROUP + 1)];
+        let mut over = [0u8; TWIN_FACT_PREFIX_SIZE + 4 + 4 * (APPROVAL_MAX_SUBGROUP + 1)];
         over[..TWIN_FACT_PREFIX_SIZE].copy_from_slice(&payload[..TWIN_FACT_PREFIX_SIZE]);
         over[TWIN_M_OFFSET] = u8::try_from(APPROVAL_MAX_SUBGROUP + 1).unwrap();
         assert!(raw_twin_block(&over).content_length().is_none());
         assert!(TwinFactView::from_payload(&over).is_none());
         // Bytes after the framed length are padding: the frame stays shorter.
-        let mut trailing = [0u8; TWIN_FACT_PREFIX_SIZE + 4 * 2 + 3];
+        let mut trailing = [0u8; TWIN_FACT_PREFIX_SIZE + 4 + 4 * 2 + 3];
         trailing[..payload.len()].copy_from_slice(payload);
         let block = raw_twin_block(&trailing);
         assert_eq!(block.content_length(), Some(full.len()));
