@@ -1181,6 +1181,27 @@ impl BlockBuilder {
     /// assert!(block.signature().iter().any(|value| *value != 0));
     /// ```
     pub fn build_signed<Crypto: CryptoTrait>(self, crypto: &Crypto) -> Result<Block, BlockError> {
+        let mut block = Block {
+            data: [0u8; MAX_BLOCK_SIZE],
+            len: 0,
+        };
+        self.build_signed_into(crypto, &mut block)?;
+        Ok(block)
+    }
+
+    /// [`Self::build_signed`], writing the block into `out` in place: no
+    /// `Block` is returned, so none is copied (Story 12.2: node #0 builds its
+    /// genesis blocks straight into the value genesis returns). On `Err`, `out`
+    /// is unchanged.
+    ///
+    /// Parameters:
+    /// - `crypto`: `moonblokz-crypto` signer handle used to sign canonical bytes.
+    /// - `out`: the block to overwrite.
+    pub fn build_signed_into<Crypto: CryptoTrait>(
+        &self,
+        crypto: &Crypto,
+        out: &mut Block,
+    ) -> Result<(), BlockError> {
         if self.header.version == 0 {
             return Err(BlockError::MalformedBlock("block version must be non-zero"));
         }
@@ -1193,7 +1214,10 @@ impl BlockBuilder {
             });
         }
 
-        let mut data = [0u8; MAX_BLOCK_SIZE];
+        // Every byte is written, the tail past `len` as zero, so `out` holds
+        // exactly what a fresh build would.
+        let data = &mut out.data;
+        data.fill(0);
 
         data[VERSION_OFFSET] = self.header.version;
         data[SEQUENCE_OFFSET..SEQUENCE_OFFSET + 4]
@@ -1232,7 +1256,8 @@ impl BlockBuilder {
         let signature = crypto.sign(&data[..SIGNING_PREIMAGE_SIZE]);
         data[SIGNATURE_OFFSET..HEADER_SIZE].copy_from_slice(signature.serialize());
 
-        Ok(Block { data, len })
+        out.len = len;
+        Ok(())
     }
 }
 
@@ -2491,6 +2516,36 @@ mod tests {
         ]);
         assert_eq!(SIGNING_PREIMAGE_SIZE, 90);
         assert_eq!(block.view().signing_preimage(), expected);
+    }
+
+    /// Story 12.2: built into a block that held a longer one, the bytes are a
+    /// fresh build's, the tail past `len` zero; a refused build leaves `out`
+    /// as it was.
+    #[test]
+    fn build_signed_into_overwrites_a_longer_block_exactly() {
+        let crypto = test_crypto();
+        let short = || BlockBuilder::new().header(sample_header());
+        let mut long = BlockBuilder::new().header(sample_header());
+        long.set_chain_config_payload(&[0xAB; 300]).expect("fits");
+        let mut out = long.build_signed(&crypto).expect("builds");
+
+        assert!(short().build_signed_into(&crypto, &mut out).is_ok());
+        let fresh = short().build_signed(&crypto).expect("builds");
+        assert_eq!(out.len, fresh.len);
+        // The signature may differ between two signings; everything else,
+        // the zero tail included, is equal.
+        assert_eq!(out.data[..SIGNATURE_OFFSET], fresh.data[..SIGNATURE_OFFSET]);
+        assert_eq!(out.data[HEADER_SIZE..], fresh.data[HEADER_SIZE..]);
+        assert!(signature_verifies(out.serialized_bytes()));
+
+        let before = out.data;
+        assert!(
+            BlockBuilder::new()
+                .build_signed_into(&crypto, &mut out)
+                .is_err()
+        );
+        assert_eq!(out.data, before);
+        assert_eq!(out.len, fresh.len);
     }
 
     #[test]
