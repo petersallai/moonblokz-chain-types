@@ -2519,8 +2519,8 @@ mod tests {
     }
 
     /// Story 12.2: built into a block that held a longer one, the bytes are a
-    /// fresh build's, the tail past `len` zero; a refused build leaves `out`
-    /// as it was.
+    /// fresh build's, the tail past `len` zero; a refused build (either check)
+    /// leaves `out` as it was.
     #[test]
     fn build_signed_into_overwrites_a_longer_block_exactly() {
         let crypto = test_crypto();
@@ -2544,6 +2544,16 @@ mod tests {
                 .build_signed_into(&crypto, &mut out)
                 .is_err()
         );
+        assert_eq!(out.data, before);
+        assert_eq!(out.len, fresh.len);
+
+        // Not reachable through the public builder, which bounds the payload.
+        let mut too_long = short();
+        too_long.payload_len = MAX_PAYLOAD_SIZE + 1;
+        assert!(matches!(
+            too_long.build_signed_into(&crypto, &mut out),
+            Err(BlockError::InputTooLarge { .. })
+        ));
         assert_eq!(out.data, before);
         assert_eq!(out.len, fresh.len);
     }
