@@ -212,6 +212,49 @@ impl<'a> TransactionView<'a> {
             data: &self.data[TX_HEADER_SIZE..],
         })
     }
+
+    /// The DEC-196 input-signature preimage of a complex transaction, written
+    /// into `buf`: the transaction's full serialized bytes — type, `vote`,
+    /// counts, every input and every output — with **every input's signature
+    /// field set to zero**. Every input, UTXO or balance, signs these same bytes
+    /// with its own key, so each signer commits to all inputs, all outputs and
+    /// the `vote` field (FR6). The one definition shared by signers and the
+    /// verifier (DEC-331), as [`crate::BlockView::signing_preimage`] is for the
+    /// block preimage.
+    ///
+    /// Returns `None` for a transaction that is not complex, whose inputs do not
+    /// frame, or when `buf` is shorter than the transaction
+    /// ([`MAX_TRANSACTION_SIZE`] always suffices).
+    pub fn input_signing_preimage<'b>(&self, buf: &'b mut [u8]) -> Option<&'b [u8]> {
+        if self.tx_type() != TX_TYPE_COMPLEX {
+            return None;
+        }
+        let out = buf.get_mut(..self.data.len())?;
+        out.copy_from_slice(self.data);
+        let mut offset = TX_HEADER_SIZE + 2;
+        for _ in 0..out[TX_HEADER_SIZE] {
+            let (size, signature) = input_layout(out, offset)?;
+            out.get_mut(signature)?.fill(0);
+            offset += size;
+        }
+        Some(out)
+    }
+}
+
+/// Size and signature-field range of the complex-transaction input that starts
+/// at `offset` of the full transaction bytes `tx`; `None` for an unknown input
+/// type or one that runs past `tx`.
+fn input_layout(tx: &[u8], offset: usize) -> Option<(usize, core::ops::Range<usize>)> {
+    let (size, signature_at) = match *tx.get(offset)? {
+        INPUT_TYPE_UTXO => (UTXO_INPUT_SIZE, 1 + UTXO_INPUT_SIGNATURE_OFFSET),
+        INPUT_TYPE_BALANCE => (BALANCE_INPUT_SIZE, 1 + BALANCE_INPUT_SIGNATURE_OFFSET),
+        _ => return None,
+    };
+    if offset + size > tx.len() {
+        return None;
+    }
+    let start = offset + signature_at;
+    Some((size, start..start + SIGNATURE_SIZE))
 }
 
 /// Zero-copy view of a node-transfer transaction body (96 bytes).
@@ -452,7 +495,8 @@ impl<'a> Iterator for OutputIterator<'a> {
     }
 }
 
-/// Zero-copy view of a UTXO input body (78 bytes, excluding type byte).
+/// Zero-copy view of a UTXO input body (`14 + SIGNATURE_SIZE` bytes, excluding the
+/// type byte: 78 / 62 / 110 with Schnorr / `bls-min-sig` / `bls-min-pk`).
 ///
 /// The input references the spent output by the sequence of the block that
 /// holds it and its position in that block's UTXO-output stream (ADR-016),
@@ -479,7 +523,8 @@ impl<'a> UtxoInputView<'a> {
     }
 }
 
-/// Zero-copy view of a balance input body (88 bytes, excluding type byte).
+/// Zero-copy view of a balance input body (`24 + SIGNATURE_SIZE` bytes, excluding
+/// the type byte: 88 / 72 / 120 with Schnorr / `bls-min-sig` / `bls-min-pk`).
 pub struct BalanceInputView<'a> {
     data: &'a [u8],
 }
@@ -502,7 +547,8 @@ impl<'a> BalanceInputView<'a> {
     }
 }
 
-/// Zero-copy view of a UTXO output body (40 bytes, excluding type byte).
+/// Zero-copy view of a UTXO output body (`PUBLIC_KEY_SIZE + 8` bytes, excluding the
+/// type byte: 40 / 104 / 56 with Schnorr / `bls-min-sig` / `bls-min-pk`).
 pub struct UtxoOutputView<'a> {
     data: &'a [u8],
 }
@@ -859,6 +905,32 @@ impl ComplexTransaction {
         self.data[p + 5..p + 13].copy_from_slice(&amount.to_le_bytes());
         self.data[6] = output_count;
         self.len = new_len;
+        Ok(self)
+    }
+
+    /// Puts `signature` into input `index`'s signature field. A signer builds the
+    /// complete transaction first (signature fields zero), takes its
+    /// [`TransactionView::input_signing_preimage`], signs it with each input's
+    /// key and fills every input with this call (DEC-196, DEC-331).
+    pub fn set_input_signature(
+        &mut self,
+        index: u8,
+        signature: &[u8; SIGNATURE_SIZE],
+    ) -> Result<&mut Self, BlockError> {
+        const NO_SUCH_INPUT: &str = "no such input";
+        if index >= self.data[TX_HEADER_SIZE] {
+            return Err(BlockError::MalformedBlock(NO_SUCH_INPUT));
+        }
+        let tx = &mut self.data[..self.len];
+        let mut offset = TX_HEADER_SIZE + 2;
+        for _ in 0..index {
+            offset += input_layout(tx, offset)
+                .ok_or(BlockError::MalformedBlock(NO_SUCH_INPUT))?
+                .0;
+        }
+        let (_, range) =
+            input_layout(tx, offset).ok_or(BlockError::MalformedBlock(NO_SUCH_INPUT))?;
+        tx[range].copy_from_slice(signature);
         Ok(self)
     }
 
@@ -1527,5 +1599,132 @@ mod tests {
         let txp = block.transactions().unwrap();
         assert_eq!(txp.count(), 0);
         assert!(txp.iter().next().is_none());
+    }
+
+    // ---- DEC-196 input-signature preimage (Story 7.1, DEC-331) ----
+
+    use moonblokz_crypto::PublicKeyTrait;
+
+    fn key(seed: u8) -> Crypto {
+        Crypto::new([seed; PRIVATE_KEY_SIZE])
+            .ok()
+            .expect("test private key should be accepted")
+    }
+
+    /// One UTXO input (key 1), one balance input (key 2), one output of each kind.
+    fn unsigned_complex() -> ComplexTransaction {
+        let zero = [0u8; SIGNATURE_SIZE];
+        let mut tx = ComplexTransaction::new(4);
+        tx.add_utxo_input(98, 3, 500, &zero).expect("utxo input");
+        tx.add_balance_input(10, 7, 200, 9, &zero)
+            .expect("balance input");
+        tx.add_utxo_output(key(3).public_key().serialize(), 600)
+            .expect("utxo output");
+        tx.add_balance_output(4, 50).expect("balance output");
+        tx
+    }
+
+    fn sign_all(tx: &mut ComplexTransaction, keys: &[Crypto]) {
+        let mut buf = [0u8; MAX_TRANSACTION_SIZE];
+        let preimage_len = {
+            let view = TransactionView::from_bytes(tx.as_bytes()).unwrap();
+            view.input_signing_preimage(&mut buf).unwrap().len()
+        };
+        for (i, k) in keys.iter().enumerate() {
+            let signature = k.sign(&buf[..preimage_len]);
+            tx.set_input_signature(i as u8, signature.serialize())
+                .expect("input exists");
+        }
+    }
+
+    fn verifies(preimage: &[u8], signature: &[u8], signer: &Crypto) -> bool {
+        let signature = moonblokz_crypto::Signature::new(signature)
+            .ok()
+            .expect("well-formed signature bytes");
+        signer.verify_signature(preimage, &signature, signer.public_key())
+    }
+
+    #[test]
+    fn the_input_preimage_is_the_whole_transaction_with_every_input_signature_zeroed() {
+        let unsigned = unsigned_complex();
+        let mut tx = unsigned_complex();
+        sign_all(&mut tx, &[key(1), key(2)]);
+        assert_ne!(
+            tx.as_bytes(),
+            unsigned.as_bytes(),
+            "the signatures were filled"
+        );
+
+        let view = TransactionView::from_bytes(tx.as_bytes()).unwrap();
+        let mut buf = [0u8; MAX_TRANSACTION_SIZE];
+        let preimage = view.input_signing_preimage(&mut buf).unwrap();
+        // Exactly the unsigned bytes: type, vote, counts, inputs, outputs, with
+        // only the two signature fields zero.
+        assert_eq!(preimage, unsigned.as_bytes());
+        assert_eq!(preimage.len(), tx.as_bytes().len());
+
+        let cx = view.as_complex().unwrap();
+        let mut inputs = cx.inputs();
+        let utxo = inputs.next().unwrap().as_utxo().unwrap();
+        let balance = inputs.next().unwrap().as_balance().unwrap();
+        assert!(verifies(preimage, utxo.signature(), &key(1)));
+        assert!(verifies(preimage, balance.signature(), &key(2)));
+        // Each input verifies only against its own key.
+        assert!(!verifies(preimage, utxo.signature(), &key(2)));
+        assert!(!verifies(preimage, balance.signature(), &key(1)));
+    }
+
+    #[test]
+    fn every_input_signature_commits_to_the_vote_and_the_outputs() {
+        let mut tx = unsigned_complex();
+        sign_all(&mut tx, &[key(1), key(2)]);
+        let signed = {
+            let mut a = [0u8; MAX_TRANSACTION_SIZE];
+            a[..tx.as_bytes().len()].copy_from_slice(tx.as_bytes());
+            (a, tx.as_bytes().len())
+        };
+        // Rewrite the vote (bytes 1..5) and, separately, the last output byte.
+        for at in [1usize, signed.1 - 1] {
+            let mut bytes = signed.0;
+            bytes[at] ^= 1;
+            let view = TransactionView::from_bytes(&bytes[..signed.1]).unwrap();
+            let mut buf = [0u8; MAX_TRANSACTION_SIZE];
+            let preimage = view.input_signing_preimage(&mut buf).unwrap();
+            let cx = view.as_complex().unwrap();
+            let mut inputs = cx.inputs();
+            let utxo = inputs.next().unwrap().as_utxo().unwrap();
+            let balance = inputs.next().unwrap().as_balance().unwrap();
+            assert!(!verifies(preimage, utxo.signature(), &key(1)));
+            assert!(!verifies(preimage, balance.signature(), &key(2)));
+        }
+    }
+
+    #[test]
+    fn the_input_preimage_refuses_a_short_buffer_and_a_non_complex_transaction() {
+        let tx = unsigned_complex();
+        let view = TransactionView::from_bytes(tx.as_bytes()).unwrap();
+        let mut short = [0u8; 8];
+        assert!(view.input_signing_preimage(&mut short).is_none());
+
+        let nt = NodeTransfer::new(1, 10, 1, 2, 3, 4, 5, &[0u8; SIGNATURE_SIZE]);
+        let nt_view = TransactionView::from_bytes(nt.as_bytes()).unwrap();
+        let mut buf = [0u8; MAX_TRANSACTION_SIZE];
+        assert!(nt_view.input_signing_preimage(&mut buf).is_none());
+
+        // A zero-input transaction has nothing to zero: its preimage is its bytes.
+        let mut empty = ComplexTransaction::new(0);
+        empty.add_balance_output(1, 1).expect("output");
+        let ev = TransactionView::from_bytes(empty.as_bytes()).unwrap();
+        assert_eq!(
+            ev.input_signing_preimage(&mut buf).unwrap(),
+            empty.as_bytes()
+        );
+    }
+
+    #[test]
+    fn set_input_signature_refuses_a_missing_input() {
+        let mut tx = unsigned_complex();
+        assert!(tx.set_input_signature(2, &[7u8; SIGNATURE_SIZE]).is_err());
+        assert!(tx.set_input_signature(1, &[7u8; SIGNATURE_SIZE]).is_ok());
     }
 }
