@@ -918,7 +918,7 @@ impl ComplexTransaction {
         signature: &[u8; SIGNATURE_SIZE],
     ) -> Result<&mut Self, BlockError> {
         const NO_SUCH_INPUT: &str = "no such input";
-        if index >= self.data[5] {
+        if index >= self.data[TX_HEADER_SIZE] {
             return Err(BlockError::MalformedBlock(NO_SUCH_INPUT));
         }
         let tx = &mut self.data[..self.len];
