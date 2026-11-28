@@ -23,12 +23,13 @@ const TX_HEADER_SIZE: usize = 5;
 // Node transfer: anchor_sequence u32 ‖ initializer u32 ‖ receiver u32 ‖ amount u64 ‖
 // fee u32 ‖ comment u64 ‖ signature.
 const NODE_TRANSFER_BODY_SIZE: usize = 32 + SIGNATURE_SIZE;
-// Registration: initializer u32 ‖ new_node_id u32 ‖ registration_price u64 ‖ fee u64 ‖
-// new_public_key ‖ new_key_signature (the proof of possession) ‖ signature.
-const REGISTRATION_BODY_SIZE: usize = 24 + PUBLIC_KEY_SIZE + 2 * SIGNATURE_SIZE;
+// Registration: anchor_sequence u32 ‖ initializer u32 ‖ new_node_id u32 ‖
+// registration_price u64 ‖ fee u64 ‖ new_public_key ‖ new_key_signature (the proof of
+// possession) ‖ signature. The anchor opens the body as in the node transfer (DEC-356).
+const REGISTRATION_BODY_SIZE: usize = 28 + PUBLIC_KEY_SIZE + 2 * SIGNATURE_SIZE;
 
 const NODE_TRANSFER_SIGNATURE_OFFSET: usize = TX_HEADER_SIZE + 32;
-const REGISTRATION_NEW_KEY_OFFSET: usize = TX_HEADER_SIZE + 24;
+const REGISTRATION_NEW_KEY_OFFSET: usize = TX_HEADER_SIZE + 28;
 const REGISTRATION_NEW_KEY_SIGNATURE_OFFSET: usize = REGISTRATION_NEW_KEY_OFFSET + PUBLIC_KEY_SIZE;
 const REGISTRATION_SIGNATURE_OFFSET: usize = REGISTRATION_NEW_KEY_SIGNATURE_OFFSET + SIGNATURE_SIZE;
 
@@ -286,32 +287,38 @@ impl<'a> NodeTransferView<'a> {
     }
 }
 
-/// Zero-copy view of a registration transaction body (184 bytes).
+/// Zero-copy view of a registration transaction body (`REGISTRATION_SIZE` minus the
+/// common header).
 pub struct RegistrationView<'a> {
     data: &'a [u8],
 }
 
 impl<'a> RegistrationView<'a> {
-    pub fn initializer(&self) -> u32 {
+    /// The window anchor (DEC-356): a registration is includable in a block of
+    /// sequence `s` only while `max(0, s − W) ≤ anchor < s`.
+    pub fn anchor_sequence(&self) -> u32 {
         read_u32_le(self.data, 0)
     }
-    pub fn new_node_id(&self) -> u32 {
+    pub fn initializer(&self) -> u32 {
         read_u32_le(self.data, 4)
     }
+    pub fn new_node_id(&self) -> u32 {
+        read_u32_le(self.data, 8)
+    }
     pub fn registration_price(&self) -> u64 {
-        read_u64_le(self.data, 8)
+        read_u64_le(self.data, 12)
     }
     pub fn fee(&self) -> u64 {
-        read_u64_le(self.data, 16)
+        read_u64_le(self.data, 20)
     }
     pub fn new_public_key(&self) -> &[u8] {
-        &self.data[24..24 + PUBLIC_KEY_SIZE]
+        &self.data[28..28 + PUBLIC_KEY_SIZE]
     }
     pub fn new_key_signature(&self) -> &[u8] {
-        &self.data[24 + PUBLIC_KEY_SIZE..24 + PUBLIC_KEY_SIZE + SIGNATURE_SIZE]
+        &self.data[28 + PUBLIC_KEY_SIZE..28 + PUBLIC_KEY_SIZE + SIGNATURE_SIZE]
     }
     pub fn signature(&self) -> &[u8] {
-        &self.data[24 + PUBLIC_KEY_SIZE + SIGNATURE_SIZE..REGISTRATION_BODY_SIZE]
+        &self.data[28 + PUBLIC_KEY_SIZE + SIGNATURE_SIZE..REGISTRATION_BODY_SIZE]
     }
 }
 
@@ -655,7 +662,7 @@ impl NodeTransfer {
     }
 }
 
-/// Owned registration transaction for block construction (189 bytes).
+/// Owned registration transaction for block construction (`REGISTRATION_SIZE` bytes).
 pub struct Registration {
     data: [u8; REGISTRATION_SIZE],
 }
@@ -665,6 +672,7 @@ impl Registration {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         vote: u32,
+        anchor_sequence: u32,
         initializer: u32,
         new_node_id: u32,
         registration_price: u64,
@@ -676,10 +684,11 @@ impl Registration {
         let mut data = [0u8; REGISTRATION_SIZE];
         data[0] = TX_TYPE_REGISTRATION;
         data[1..5].copy_from_slice(&vote.to_le_bytes());
-        data[5..9].copy_from_slice(&initializer.to_le_bytes());
-        data[9..13].copy_from_slice(&new_node_id.to_le_bytes());
-        data[13..21].copy_from_slice(&registration_price.to_le_bytes());
-        data[21..29].copy_from_slice(&fee.to_le_bytes());
+        data[5..9].copy_from_slice(&anchor_sequence.to_le_bytes());
+        data[9..13].copy_from_slice(&initializer.to_le_bytes());
+        data[13..17].copy_from_slice(&new_node_id.to_le_bytes());
+        data[17..25].copy_from_slice(&registration_price.to_le_bytes());
+        data[25..33].copy_from_slice(&fee.to_le_bytes());
         data[REGISTRATION_NEW_KEY_OFFSET..REGISTRATION_NEW_KEY_SIGNATURE_OFFSET]
             .copy_from_slice(new_public_key);
         data[REGISTRATION_NEW_KEY_SIGNATURE_OFFSET..REGISTRATION_SIGNATURE_OFFSET]
@@ -699,6 +708,7 @@ impl Registration {
     #[allow(clippy::too_many_arguments)]
     pub fn new_signed<Crypto: CryptoTrait>(
         vote: u32,
+        anchor_sequence: u32,
         initializer: u32,
         new_node_id: u32,
         registration_price: u64,
@@ -709,6 +719,7 @@ impl Registration {
         let zero_signature = [0u8; SIGNATURE_SIZE];
         let mut tx = Self::new(
             vote,
+            anchor_sequence,
             initializer,
             new_node_id,
             registration_price,
@@ -1128,7 +1139,7 @@ mod tests {
 
         let public_key = [0xBB; PUBLIC_KEY_SIZE];
         let key_sig = [0xCC; SIGNATURE_SIZE];
-        let reg = Registration::new(50, 1, 42, 1000, 10, &public_key, &key_sig, &sig);
+        let reg = Registration::new(50, 7, 1, 42, 1000, 10, &public_key, &key_sig, &sig);
         let reg_view = TransactionView::from_bytes(reg.as_bytes()).unwrap();
         assert_eq!(reg.hash(), calculate_hash(reg.as_bytes()));
         assert_eq!(reg_view.hash(), reg.hash());
@@ -1209,10 +1220,11 @@ mod tests {
         let mut tx_bytes = [0u8; REGISTRATION_SIZE];
         tx_bytes[0] = TX_TYPE_REGISTRATION;
         tx_bytes[1..5].copy_from_slice(&50u32.to_le_bytes());
-        tx_bytes[5..9].copy_from_slice(&1u32.to_le_bytes());
-        tx_bytes[9..13].copy_from_slice(&42u32.to_le_bytes());
-        tx_bytes[13..21].copy_from_slice(&1000u64.to_le_bytes());
-        tx_bytes[21..29].copy_from_slice(&10u64.to_le_bytes());
+        tx_bytes[5..9].copy_from_slice(&0xA1B2_C3D4u32.to_le_bytes());
+        tx_bytes[9..13].copy_from_slice(&1u32.to_le_bytes());
+        tx_bytes[13..17].copy_from_slice(&42u32.to_le_bytes());
+        tx_bytes[17..25].copy_from_slice(&1000u64.to_le_bytes());
+        tx_bytes[25..33].copy_from_slice(&10u64.to_le_bytes());
         tx_bytes[REGISTRATION_NEW_KEY_OFFSET..REGISTRATION_NEW_KEY_SIGNATURE_OFFSET].fill(0xCC);
         tx_bytes[REGISTRATION_NEW_KEY_SIGNATURE_OFFSET..REGISTRATION_SIGNATURE_OFFSET].fill(0xDD);
         tx_bytes[REGISTRATION_SIGNATURE_OFFSET..].fill(0xEE);
@@ -1223,6 +1235,7 @@ mod tests {
         assert_eq!(tx.vote(), 50);
 
         let reg = tx.as_registration().unwrap();
+        assert_eq!(reg.anchor_sequence(), 0xA1B2_C3D4);
         assert_eq!(reg.initializer(), 1);
         assert_eq!(reg.new_node_id(), 42);
         assert_eq!(reg.registration_price(), 1000);
@@ -1344,7 +1357,7 @@ mod tests {
         let pub_key = [0xCC; PUBLIC_KEY_SIZE];
         let key_sig = [0xDD; SIGNATURE_SIZE];
         let sig = [0xEE; SIGNATURE_SIZE];
-        let reg = Registration::new(50, 1, 42, 1000, 10, &pub_key, &key_sig, &sig);
+        let reg = Registration::new(50, 0xA1B2_C3D4, 1, 42, 1000, 10, &pub_key, &key_sig, &sig);
         let bytes = reg.as_bytes();
         assert_eq!(bytes.len(), REGISTRATION_SIZE);
 
@@ -1352,6 +1365,7 @@ mod tests {
         assert_eq!(view.tx_type(), 2);
         assert_eq!(view.vote(), 50);
         let rv = view.as_registration().unwrap();
+        assert_eq!(rv.anchor_sequence(), 0xA1B2_C3D4);
         assert_eq!(rv.initializer(), 1);
         assert_eq!(rv.new_node_id(), 42);
         assert_eq!(rv.registration_price(), 1000);
@@ -1430,11 +1444,11 @@ mod tests {
         // formula error that shows under one scheme only cannot pass: header, node
         // transfer, registration, UTXO input, balance input, UTXO output, node info.
         #[cfg(feature = "schnorr")]
-        const EXPECTED: [usize; 7] = [122, 101, 189, 79, 89, 41, 48];
+        const EXPECTED: [usize; 7] = [122, 101, 193, 79, 89, 41, 48];
         #[cfg(feature = "bls-min-sig")]
-        const EXPECTED: [usize; 7] = [106, 85, 221, 63, 73, 105, 112];
+        const EXPECTED: [usize; 7] = [106, 85, 225, 63, 73, 105, 112];
         #[cfg(feature = "bls-min-pk")]
-        const EXPECTED: [usize; 7] = [154, 133, 269, 111, 121, 57, 64];
+        const EXPECTED: [usize; 7] = [154, 133, 273, 111, 121, 57, 64];
         assert_eq!(
             [
                 crate::HEADER_SIZE,
