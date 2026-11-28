@@ -97,6 +97,7 @@ Registers a new node identifier and public key on the network.
 
 | Field | Type | Description |
 |---|---|---|
+| `anchor_sequence` | `u32` | Window anchor, as in the node transfer (DEC-356): the registration is includable only in a block of sequence `s` with `max(0, s − W) ≤ anchor_sequence < s`, so it leaves every mempool within `W` blocks. Block #0's node-#0 registration carries 0. |
 | `initializer` | `u32` | The existing node that initiates (and pays for) the registration. |
 | `new_node_id` | `u32` | Identifier of the new node (max existing node_id + 1). Generated when the transaction is added to a block. |
 | `registration_price` | `u64` | Cost of registering a new public key. Configurable, depends on dynamic factors (e.g. total number of nodes). Nobody receives this fee — the network absorbs it. |
@@ -105,8 +106,8 @@ Registers a new node identifier and public key on the network.
 | `new_key_signature` | `[u8; 64]` | Proof that the registrant possesses the private key corresponding to `new_public_key` (Schnorr signature of the public key). |
 | `signature` | `[u8; 64]` | Digital signature of the entire transaction by the initializer. |
 
-No `anchor_sequence` or `comment` fields are needed because the public key
-alone ensures uniqueness.
+No `comment` field is needed: the public key alone ensures uniqueness. The
+`anchor_sequence` bounds the registration's lifetime, not its uniqueness.
 
 #### Complex Transaction (type 3)
 
